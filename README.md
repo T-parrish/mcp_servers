@@ -67,6 +67,19 @@ returns an `auth_required` result prompting you to call `authenticate` again.
 > This adds to **your own** cart on **your own** account. Because it modifies real account state and
 > the endpoint is reverse-engineered, it is dry-run by default; verify the first live call yourself.
 
+## Rate limiting
+
+All outbound requests (search, auth check, cart) pass through a shared limiter in the HTTP client, so
+no tool can hammer Bandcamp's API. Two env vars tune it:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `BANDCAMP_MAX_CONCURRENT_REQUESTS` | `1` | Maximum requests in flight at once. |
+| `BANDCAMP_MIN_REQUEST_INTERVAL_MS` | `750` | Minimum spacing between request *starts*, plus a small random jitter. |
+
+The defaults are deliberately gentle (fully serialized, ~0.75–1.1s apart). Raise concurrency and/or
+lower the interval for more throughput.
+
 ## Build
 
 ```sh
@@ -86,6 +99,9 @@ The server communicates over **stdio**. Point your MCP client at the built binar
       "command": "/absolute/path/to/target/release/bandcamp_mcp_server",
       "env": {
         "RUST_LOG": "info",
+        // Optional rate-limit tuning (see Rate limiting):
+        // "BANDCAMP_MAX_CONCURRENT_REQUESTS": "1",
+        // "BANDCAMP_MIN_REQUEST_INTERVAL_MS": "750",
         // Optional, for live add_to_cart (see Cart & authentication). The cookie can
         // instead be supplied at runtime via the `authenticate` tool:
         // "BANDCAMP_ALLOW_CART_WRITES": "1",
@@ -95,6 +111,21 @@ The server communicates over **stdio**. Point your MCP client at the built binar
   }
 }
 ```
+
+## Configuration via `.env`
+
+On startup the server loads a `.env` file from its **working directory** (searching parent
+directories), so you can keep settings out of the client config. Copy the template and edit:
+
+```sh
+cp .env.example .env
+```
+
+- `.env` is **gitignored** — it may hold your `BANDCAMP_COOKIE`, so never commit it.
+- **Real environment variables take precedence** over `.env` values.
+- Loading is relative to the process's working directory. When launched by an MCP client, set the
+  client's working directory to the repo root (or wherever your `.env` lives) — otherwise it won't be
+  found. All env vars from the sections above are accepted in `.env`.
 
 ## Logging & tracing
 

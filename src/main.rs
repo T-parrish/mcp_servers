@@ -10,6 +10,10 @@ use crate::server::BandcampServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env (from the working directory) before anything reads the
+    // environment. Real environment variables take precedence over it.
+    let dotenv_path = dotenv::dotenv().ok();
+
     // MCP over stdio uses stdout for the protocol stream, so all logs/traces
     // must go to stderr. Level is controlled by RUST_LOG (default: info).
     tracing_subscriber::fmt()
@@ -20,6 +24,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    match dotenv_path {
+        Some(path) => tracing::info!(path = %path.display(), "loaded .env"),
+        None => tracing::debug!("no .env file found"),
+    }
     tracing::info!("starting bandcamp MCP server (stdio transport)");
 
     let service = BandcampServer::new()

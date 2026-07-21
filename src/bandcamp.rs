@@ -7,10 +7,12 @@
 //! per-action logic (filtering, output shaping) lives in `crate::tools`.
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::Deserialize;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 const IDENTITY_URL: &str = "https://bandcamp.com/api/fan/2/collection_summary";
@@ -56,9 +58,62 @@ fn cookie_file_path() -> PathBuf {
     config_dir.join("bandcamp_mcp_server").join("cookie")
 }
 
+/// A small jitter in `[0, span/2]`, using the clock as cheap entropy so paced
+/// requests don't land on an exact grid.
+fn jitter(span: Duration) -> Duration {
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    span.mul_f64((n as f64 / 1_000_000_000.0) * 0.5)
+}
+
+/// Bounds outbound requests: at most `max_concurrent` in flight, and request
+/// *starts* spaced at least `min_interval` (plus jitter) apart.
+struct RateLimiter {
+    semaphore: Semaphore,
+    min_interval: Duration,
+    /// Earliest instant the next request may start.
+    next_slot: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    fn new(max_concurrent: usize, min_interval: Duration) -> Self {
+        Self {
+            semaphore: Semaphore::new(max_concurrent),
+            min_interval,
+            next_slot: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Wait for a concurrency slot and the paced start time, returning a permit
+    /// that must be held for the duration of the request.
+    async fn acquire(&self) -> SemaphorePermit<'_> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("rate-limiter semaphore is never closed");
+
+        // Reserve a paced start slot. The std mutex is dropped before awaiting.
+        let start_at = {
+            let mut slot = self.next_slot.lock().unwrap();
+            let start_at = (*slot).max(Instant::now());
+            *slot = start_at + self.min_interval + jitter(self.min_interval);
+            start_at
+        };
+        if let Some(delay) = start_at.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(delay).await;
+        }
+        permit
+    }
+}
+
 /// Client holding a reusable HTTP connection pool plus cart auth state.
 pub struct BandcampClient {
     http: reqwest::Client,
+    /// Guards every outbound request against hammering Bandcamp's API.
+    limiter: RateLimiter,
     /// The `Cookie` header for authenticated (cart) requests. Refreshable at
     /// runtime via [`save_cookie`]; loaded at startup from env or the cookie file.
     ///
@@ -74,9 +129,23 @@ impl BandcampClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(Duration::from_secs(15))
             .build()
             .expect("failed to build HTTP client");
+
+        // Rate-limit config. Concurrency is the requested knob; the paced
+        // interval is what actually prevents bursty hammering.
+        let max_concurrent = std::env::var("BANDCAMP_MAX_CONCURRENT_REQUESTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+        let min_interval_ms = std::env::var("BANDCAMP_MIN_REQUEST_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(750);
+        tracing::info!(max_concurrent, min_interval_ms, "configured request rate limiter");
+        let limiter = RateLimiter::new(max_concurrent, Duration::from_millis(min_interval_ms));
 
         let cookie_file = cookie_file_path();
         // Startup load: env var wins, then the cached file.
@@ -104,6 +173,7 @@ impl BandcampClient {
 
         Self {
             http,
+            limiter,
             cookie: RwLock::new(cookie),
             cookie_file,
             allow_cart_writes,
@@ -153,6 +223,7 @@ impl BandcampClient {
         let Some(cookie) = self.cookie.read().unwrap().clone() else {
             return SessionStatus::NoCookie;
         };
+        let _permit = self.limiter.acquire().await;
         let resp = match self
             .http
             .get(IDENTITY_URL)
@@ -218,6 +289,7 @@ impl BandcampClient {
         })?;
         let url = format!("{origin}/cart/cb");
 
+        let _permit = self.limiter.acquire().await;
         tracing::info!(%url, "sending cart add request");
         let resp = self
             .http
@@ -272,6 +344,7 @@ impl BandcampClient {
             "fan_id": null,
         });
 
+        let _permit = self.limiter.acquire().await;
         tracing::debug!("querying bandcamp autocomplete");
         let resp = self
             .http
