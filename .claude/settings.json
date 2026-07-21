@@ -1,0 +1,24 @@
+{
+  "defaultMode": "auto",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit(/src/**)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "deny": [
+      "Bash(cargo publish *)",
+      "Bash(git push *)",
+      "Bash(rm *)",
+      "Bash(sudo *)"
+    ]
+  }
+}
