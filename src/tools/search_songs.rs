@@ -24,6 +24,8 @@ pub struct SearchSongsParams {
 struct Song {
     title: String,
     artist: Option<String>,
+    /// Seller band id, needed to add the item to a cart.
+    band_id: Option<i64>,
     album: Option<String>,
     track_id: Option<i64>,
     url: Option<String>,
@@ -34,6 +36,7 @@ impl From<RawResult> for Song {
         Song {
             title: r.name.unwrap_or_default(),
             artist: r.band_name,
+            band_id: r.band_id,
             album: r.album_name,
             track_id: r.id,
             url: r.item_url_path,

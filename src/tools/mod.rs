@@ -11,6 +11,7 @@
 //!    `+ BandcampServer::<action>_router()` in [`router`].
 
 mod add_to_cart;
+mod authenticate;
 mod search_artists;
 mod search_songs;
 
@@ -27,6 +28,7 @@ pub(crate) fn router() -> ToolRouter<BandcampServer> {
     BandcampServer::search_artists_router()
         + BandcampServer::search_songs_router()
         + BandcampServer::add_to_cart_router()
+        + BandcampServer::authenticate_router()
 }
 
 /// Serialize a value to a pretty-JSON tool result. Shared by all actions.
