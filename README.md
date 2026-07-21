@@ -55,10 +55,26 @@ Uses [`tracing`](https://crates.io/crates/tracing) with instrumented spans on ev
 
 ```
 src/
-  main.rs       tracing setup + stdio server startup
-  server.rs     MCP tool definitions and request handling (rmcp)
-  bandcamp.rs   client for Bandcamp's internal search API + result types
+  main.rs              tracing setup + stdio server startup
+  server.rs            BandcampServer type: shared client + combined tool router
+  bandcamp.rs          low-level client for Bandcamp's internal API + wire types
+  tools/
+    mod.rs             combines the action routers; shared helpers
+    search_artists.rs  one action: params + output type + #[tool] handler
+    search_songs.rs    "
+    add_to_cart.rs     "
 ```
+
+### Adding a new action
+
+1. Create `src/tools/<action>.rs` with a
+   `#[tool_router(router = <action>_router, vis = "pub")]` impl block on
+   `BandcampServer` containing the `#[tool]` handler (see the existing actions).
+2. In `src/tools/mod.rs`, add `mod <action>;` and
+   `+ BandcampServer::<action>_router()` in `router()`.
+
+Shared HTTP logic goes on `BandcampClient` in `bandcamp.rs`; reach it from a
+handler via `self.client()`.
 
 ## Limitations
 

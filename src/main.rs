@@ -1,5 +1,6 @@
 mod bandcamp;
 mod server;
+mod tools;
 
 use anyhow::Result;
 use rmcp::{ServiceExt, transport::stdio};
