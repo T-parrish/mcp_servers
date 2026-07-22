@@ -93,9 +93,30 @@ impl BandcampServer {
                           session via BANDCAMP_COOKIE. Dry-run by default: it only sends the real \
                           request when BANDCAMP_ALLOW_CART_WRITES=1, otherwise it returns the \
                           request that would be sent. unit_price must meet the item's minimum.")]
+    #[tracing::instrument(
+        name = "tools/call add_to_cart",
+        skip_all,
+        fields(
+            otel.kind = "server",
+            mcp.method.name = "tools/call",
+            mcp.tool.name = "add_to_cart",
+            item_id = params.item_id,
+            dry_run = !self.client().cart_writes_enabled(),
+        ),
+        err,
+    )]
     async fn add_to_cart(
         &self,
         Parameters(params): Parameters<AddToCartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self.add_to_cart_inner(params).await;
+        crate::metrics::record_tool_call("add_to_cart", crate::tools::outcome(&result));
+        result
+    }
+
+    async fn add_to_cart_inner(
+        &self,
+        params: AddToCartParams,
     ) -> Result<CallToolResult, McpError> {
         let item_type = item_type_code(params.item_type.as_deref().unwrap_or("album"))?;
         let quantity = params.quantity.unwrap_or(1);

@@ -3,8 +3,11 @@
   "permissions": {
     "allow": [
       "Read",
+      "Update(*)",
       "Edit(/src/**)",
+      "Bash(sed *)",
       "Bash(cargo build *)",
+      "Bash(cargo add *)",
       "Bash(cargo test *)",
       "Bash(cargo clippy *)",
       "Bash(cargo fmt *)",

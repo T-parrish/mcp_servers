@@ -38,9 +38,29 @@ impl BandcampServer {
     #[tool(description = "Check Bandcamp authentication status, or set a session cookie for cart \
                           operations. Pass `from_browser:true` to pull the cookie from Chrome \
                           automatically, or `cookie` to set it manually; omit both to see status.")]
+    // `skip_all`: the params carry a session cookie, which must never reach a span.
+    #[tracing::instrument(
+        name = "tools/call authenticate",
+        skip_all,
+        fields(
+            otel.kind = "server",
+            mcp.method.name = "tools/call",
+            mcp.tool.name = "authenticate",
+        ),
+        err,
+    )]
     async fn authenticate(
         &self,
         Parameters(params): Parameters<AuthenticateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self.authenticate_inner(params).await;
+        crate::metrics::record_tool_call("authenticate", crate::tools::outcome(&result));
+        result
+    }
+
+    async fn authenticate_inner(
+        &self,
+        params: AuthenticateParams,
     ) -> Result<CallToolResult, McpError> {
         let client = self.client();
 

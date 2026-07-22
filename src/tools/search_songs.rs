@@ -48,9 +48,29 @@ impl From<RawResult> for Song {
 impl BandcampServer {
     #[tool(description = "Search Bandcamp for songs (tracks) by a given artist. \
                           Optionally narrow with a partial track title.")]
+    #[tracing::instrument(
+        name = "tools/call search_songs",
+        skip_all,
+        fields(
+            otel.kind = "server",
+            mcp.method.name = "tools/call",
+            mcp.tool.name = "search_songs",
+            result.count = tracing::field::Empty,
+        ),
+        err,
+    )]
     async fn search_songs(
         &self,
         Parameters(params): Parameters<SearchSongsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self.search_songs_inner(params).await;
+        crate::metrics::record_tool_call("search_songs", crate::tools::outcome(&result));
+        result
+    }
+
+    async fn search_songs_inner(
+        &self,
+        params: SearchSongsParams,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(10);
         let search_text = match params.query.as_deref() {
@@ -76,6 +96,7 @@ impl BandcampServer {
             .take(limit)
             .map(Song::from)
             .collect();
+        tracing::Span::current().record("result.count", songs.len());
         tracing::info!(count = songs.len(), "song search complete");
         json_result(&songs)
     }
