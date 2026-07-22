@@ -1,10 +1,11 @@
 mod bandcamp;
+mod metrics;
 mod server;
+mod telemetry;
 mod tools;
 
 use anyhow::Result;
 use rmcp::{ServiceExt, transport::stdio};
-use tracing_subscriber::EnvFilter;
 
 use crate::server::BandcampServer;
 
@@ -14,15 +15,8 @@ async fn main() -> Result<()> {
     // environment. Real environment variables take precedence over it.
     let dotenv_path = dotenv::dotenv().ok();
 
-    // MCP over stdio uses stdout for the protocol stream, so all logs/traces
-    // must go to stderr. Level is controlled by RUST_LOG (default: info).
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Dropped at the end of `main`, which flushes any buffered spans.
+    let _telemetry = telemetry::init()?;
 
     match dotenv_path {
         Some(path) => tracing::info!(path = %path.display(), "loaded .env"),

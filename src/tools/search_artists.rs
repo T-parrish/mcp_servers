@@ -41,9 +41,29 @@ impl From<RawResult> for Artist {
 #[tool_router(router = search_artists_router, vis = "pub")]
 impl BandcampServer {
     #[tool(description = "Search Bandcamp for artists / bands by name.")]
+    #[tracing::instrument(
+        name = "tools/call search_artists",
+        skip_all,
+        fields(
+            otel.kind = "server",
+            mcp.method.name = "tools/call",
+            mcp.tool.name = "search_artists",
+            result.count = tracing::field::Empty,
+        ),
+        err,
+    )]
     async fn search_artists(
         &self,
         Parameters(params): Parameters<SearchArtistsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self.search_artists_inner(params).await;
+        crate::metrics::record_tool_call("search_artists", crate::tools::outcome(&result));
+        result
+    }
+
+    async fn search_artists_inner(
+        &self,
+        params: SearchArtistsParams,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(10);
         // "b" = band/artist entity ("a" is albums, "t" is tracks).
@@ -58,6 +78,7 @@ impl BandcampServer {
             .take(limit)
             .map(Artist::from)
             .collect();
+        tracing::Span::current().record("result.count", artists.len());
         tracing::info!(count = artists.len(), "artist search complete");
         json_result(&artists)
     }

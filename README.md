@@ -135,11 +135,83 @@ Uses [`tracing`](https://crates.io/crates/tracing) with instrumented spans on ev
 - Verbosity is controlled by `RUST_LOG` (default `info`), e.g. `RUST_LOG=debug` to see the outgoing
   Bandcamp requests.
 
+### OpenTelemetry export
+
+Spans and metrics can additionally be exported over OTLP (HTTP/protobuf). This is **off unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set**, so the default local experience is unchanged:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_SERVICE_NAME=bandcamp-mcp \
+  ./target/release/bandcamp_mcp_server
+```
+
+The standard `OTEL_*` variables (endpoint, headers, timeout, service name, resource attributes) are
+honoured; `service.name` falls back to the crate name and `service.version` to the crate version.
+Each tool call becomes a `SERVER` span (`tools/call <name>`, with `mcp.method.name` / `mcp.tool.name`)
+containing a `CLIENT` span per Bandcamp request (`http.request.method`, `url.full`, `server.address`,
+`http.response.status_code`). Buffered telemetry is flushed on shutdown.
+
+The two signals can be pointed at different backends, or enabled independently, with
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. Per the OTLP spec those
+signal-specific variables are used **as-is**, so they must include the `/v1/traces` or `/v1/metrics`
+path — only the shared `OTEL_EXPORTER_OTLP_ENDPOINT` gets it appended. Metrics are exported every
+`OTEL_METRIC_EXPORT_INTERVAL` ms (default 60000).
+
+| Instrument | Type | Unit | Attributes |
+| --- | --- | --- | --- |
+| `mcp.tool.calls` | counter | `{call}` | `mcp.tool.name`, `outcome` (`ok` / `error`) |
+| `bandcamp.request.duration` | histogram | `s` | `http.request.method`, `server.address`, `http.response.status_code` (or `error.type` when the request never completed) |
+| `bandcamp.rate_limiter.wait.duration` | histogram | `s` | — |
+
+`bandcamp.rate_limiter.wait.duration` measures time blocked before a request starts, so it shows
+whether the [rate limiter](#rate-limiting) rather than Bandcamp is your latency. `outcome=error`
+counts *protocol* errors only — a tool that returns an in-band failure such as `auth_required` is
+still a successful call.
+
+Only this crate's spans are exported. rmcp's own `serve_inner` span lives for the whole stdio
+session, so leaving it in would make every trace a child of one span that does not close until the
+client disconnects — nothing would be queryable until then. Filtering it out gives one complete
+trace per tool call.
+
+Because MCP-over-stdio has no standard place to carry W3C trace context, each tool call starts a new
+trace — it cannot be linked to the calling agent's trace.
+
+### Viewing telemetry locally
+
+`docker-compose.yml` runs [`grafana/otel-lgtm`](https://github.com/grafana/docker-otel-lgtm) — Grafana
+with Tempo (traces), Prometheus (metrics) and Loki, pre-wired in one container. It ingests OTLP
+directly, so no collector is needed:
+
+```sh
+docker compose up -d
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_SERVICE_NAME=bandcamp-mcp \
+OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  ./target/release/bandcamp_mcp_server
+```
+
+Then open <http://localhost:3000> (login `admin` / `admin`):
+
+- **Explore → Tempo** for traces. Search `{ resource.service.name="bandcamp-mcp" }`; each tool call is
+  a `tools/call <name>` span with the Bandcamp request nested inside it. Tempo buffers before making
+  a trace searchable, so allow a few seconds after a call before it appears.
+- **Explore → Prometheus** for the instruments, where the OTLP names arrive normalised to
+  `mcp_tool_calls_total`, `bandcamp_request_duration_seconds`, and
+  `bandcamp_rate_limiter_wait_duration_seconds`.
+
+Storage is in-memory: restarting the container discards everything. That suits "why was that call
+slow" and short-lived stdio sessions, but not trends over time — for that you want a durable backend
+(Tempo/Prometheus proper, SigNoz, or a hosted OTLP endpoint), which is a change of
+`OTEL_EXPORTER_OTLP_ENDPOINT` and nothing else.
+
 ## Project layout
 
 ```
 src/
-  main.rs              tracing setup + stdio server startup
+  main.rs              stdio server startup
+  telemetry.rs         stderr logging + optional OTLP span/metric export
+  metrics.rs           the OpenTelemetry instruments
   server.rs            BandcampServer type: shared client + combined tool router
   bandcamp.rs          low-level client for Bandcamp's internal API + wire types
   tools/

@@ -89,6 +89,7 @@ impl RateLimiter {
     /// Wait for a concurrency slot and the paced start time, returning a permit
     /// that must be held for the duration of the request.
     async fn acquire(&self) -> SemaphorePermit<'_> {
+        let waited_from = Instant::now();
         let permit = self
             .semaphore
             .acquire()
@@ -105,6 +106,7 @@ impl RateLimiter {
         if let Some(delay) = start_at.checked_duration_since(Instant::now()) {
             tokio::time::sleep(delay).await;
         }
+        crate::metrics::record_rate_limiter_wait(waited_from.elapsed());
         permit
     }
 }
@@ -218,12 +220,26 @@ impl BandcampClient {
 
     /// Check whether the loaded cookie is a valid logged-in session, via the
     /// identity endpoint (which replies `{"error":true,...}` when not logged in).
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(
+        name = "GET",
+        skip(self),
+        fields(
+            otel.kind = "client",
+            otel.name = "GET",
+            otel.status_code = tracing::field::Empty,
+            http.request.method = "GET",
+            url.full = IDENTITY_URL,
+            server.address = "bandcamp.com",
+            http.response.status_code = tracing::field::Empty,
+        )
+    )]
     pub(crate) async fn verify_session(&self) -> SessionStatus {
+        let span = tracing::Span::current();
         let Some(cookie) = self.cookie.read().unwrap().clone() else {
             return SessionStatus::NoCookie;
         };
         let _permit = self.limiter.acquire().await;
+        let started = Instant::now();
         let resp = match self
             .http
             .get(IDENTITY_URL)
@@ -232,11 +248,26 @@ impl BandcampClient {
             .await
         {
             Ok(r) => r,
-            Err(e) => return SessionStatus::Unknown(e.to_string()),
+            Err(e) => {
+                span.record("otel.status_code", "error");
+                crate::metrics::record_request("GET", "bandcamp.com", None, started.elapsed());
+                return SessionStatus::Unknown(e.to_string());
+            }
         };
+        let status = resp.status();
+        span.record("http.response.status_code", status.as_u16());
+        crate::metrics::record_request(
+            "GET",
+            "bandcamp.com",
+            Some(status.as_u16()),
+            started.elapsed(),
+        );
         let json: serde_json::Value = match resp.json().await {
             Ok(j) => j,
-            Err(e) => return SessionStatus::Unknown(e.to_string()),
+            Err(e) => {
+                span.record("otel.status_code", "error");
+                return SessionStatus::Unknown(e.to_string());
+            }
         };
         if json.get("error").and_then(|v| v.as_bool()).unwrap_or(false) {
             return SessionStatus::Invalid;
@@ -278,19 +309,37 @@ impl BandcampClient {
     /// this always sends.
     ///
     /// [`cart_writes_enabled`]: Self::cart_writes_enabled
-    #[tracing::instrument(skip(self, form), fields(origin = %origin))]
+    #[tracing::instrument(
+        name = "POST",
+        skip(self, form),
+        fields(
+            otel.kind = "client",
+            otel.name = "POST",
+            otel.status_code = tracing::field::Empty,
+            http.request.method = "POST",
+            url.full = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+        )
+    )]
     pub(crate) async fn post_cart_cb(
         &self,
         origin: &str,
         form: &[(&str, String)],
     ) -> Result<serde_json::Value, CartError> {
+        let span = tracing::Span::current();
         let cookie = self.cookie.read().unwrap().clone().ok_or_else(|| {
+            span.record("otel.status_code", "error");
             CartError::AuthRequired("no session cookie is loaded".to_string())
         })?;
         let url = format!("{origin}/cart/cb");
+        let host = origin.trim_start_matches("https://").to_string();
+        span.record("url.full", &url);
+        span.record("server.address", &host);
 
         let _permit = self.limiter.acquire().await;
         tracing::info!(%url, "sending cart add request");
+        let started = Instant::now();
         let resp = self
             .http
             .post(&url)
@@ -300,28 +349,40 @@ impl BandcampClient {
             .form(form)
             .send()
             .await
-            .map_err(|e| CartError::Other(anyhow::Error::new(e).context("cart request failed")))?;
+            .map_err(|e| {
+                span.record("otel.status_code", "error");
+                crate::metrics::record_request("POST", &host, None, started.elapsed());
+                CartError::Other(anyhow::Error::new(e).context("cart request failed"))
+            })?;
 
         let status = resp.status();
+        span.record("http.response.status_code", status.as_u16());
+        crate::metrics::record_request("POST", &host, Some(status.as_u16()), started.elapsed());
         let text = resp.text().await.unwrap_or_default();
         let snippet: String = text.chars().take(400).collect();
 
         // 401/403, or a login page served instead of JSON, means the cookie expired.
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            span.record("otel.status_code", "error");
             return Err(CartError::AuthRequired(format!(
                 "bandcamp rejected the session cookie (HTTP {status})"
             )));
         }
         if !status.is_success() {
+            span.record("otel.status_code", "error");
             return Err(CartError::Other(anyhow::anyhow!(
                 "cart returned HTTP {status}: {snippet}"
             )));
         }
         match serde_json::from_str(&text) {
             Ok(json) => Ok(json),
-            Err(_) if looks_like_login(&text) => Err(CartError::AuthRequired(
-                "bandcamp returned a login page; the session cookie is likely expired".to_string(),
-            )),
+            Err(_) if looks_like_login(&text) => {
+                span.record("otel.status_code", "error");
+                Err(CartError::AuthRequired(
+                    "bandcamp returned a login page; the session cookie is likely expired"
+                        .to_string(),
+                ))
+            }
             Err(e) => Err(CartError::Other(anyhow::Error::new(e).context(format!(
                 "cart returned non-JSON (HTTP {status}): {snippet}"
             )))),
@@ -331,7 +392,21 @@ impl BandcampClient {
     /// Query the autocomplete endpoint with a search-filter code.
     ///
     /// Filter codes: `"b"` = bands/artists, `"t"` = tracks, `"a"` = albums.
-    #[tracing::instrument(skip(self), fields(search_text = %search_text, filter = %filter))]
+    #[tracing::instrument(
+        name = "POST",
+        skip(self),
+        fields(
+            otel.kind = "client",
+            otel.name = "POST",
+            http.request.method = "POST",
+            url.full = SEARCH_URL,
+            server.address = "bandcamp.com",
+            http.response.status_code = tracing::field::Empty,
+            search_text = %search_text,
+            filter = %filter,
+        ),
+        err,
+    )]
     pub(crate) async fn autocomplete(
         &self,
         search_text: &str,
@@ -346,15 +421,26 @@ impl BandcampClient {
 
         let _permit = self.limiter.acquire().await;
         tracing::debug!("querying bandcamp autocomplete");
+        let started = Instant::now();
         let resp = self
             .http
             .post(SEARCH_URL)
             .json(&body)
             .send()
             .await
+            .inspect_err(|_| {
+                crate::metrics::record_request("POST", "bandcamp.com", None, started.elapsed());
+            })
             .context("request to bandcamp failed")?;
 
         let status = resp.status();
+        tracing::Span::current().record("http.response.status_code", status.as_u16());
+        crate::metrics::record_request(
+            "POST",
+            "bandcamp.com",
+            Some(status.as_u16()),
+            started.elapsed(),
+        );
         if !status.is_success() {
             anyhow::bail!("bandcamp returned HTTP {status}");
         }
