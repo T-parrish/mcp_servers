@@ -1,4 +1,5 @@
 /target
 
-# Local environment config — may contain a live session cookie. Never commit.
+# Local environment config — holds credentials (Spotify client ID, Bandcamp
+# session cookie). Never commit.
 .env

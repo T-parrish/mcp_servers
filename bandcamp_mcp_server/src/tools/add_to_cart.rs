@@ -89,10 +89,12 @@ fn rand_id() -> String {
 
 #[tool_router(router = add_to_cart_router, vis = "pub")]
 impl BandcampServer {
-    #[tool(description = "Add a Bandcamp item to your cart by its item id. Requires a logged-in \
+    #[tool(
+        description = "Add a Bandcamp item to your cart by its item id. Requires a logged-in \
                           session via BANDCAMP_COOKIE. Dry-run by default: it only sends the real \
                           request when BANDCAMP_ALLOW_CART_WRITES=1, otherwise it returns the \
-                          request that would be sent. unit_price must meet the item's minimum.")]
+                          request that would be sent. unit_price must meet the item's minimum."
+    )]
     #[tracing::instrument(
         name = "tools/call add_to_cart",
         skip_all,
@@ -110,14 +112,11 @@ impl BandcampServer {
         Parameters(params): Parameters<AddToCartParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self.add_to_cart_inner(params).await;
-        crate::metrics::record_tool_call("add_to_cart", crate::tools::outcome(&result));
+        mcp_core::metrics::record_tool_call("add_to_cart", crate::tools::outcome(&result));
         result
     }
 
-    async fn add_to_cart_inner(
-        &self,
-        params: AddToCartParams,
-    ) -> Result<CallToolResult, McpError> {
+    async fn add_to_cart_inner(&self, params: AddToCartParams) -> Result<CallToolResult, McpError> {
         let item_type = item_type_code(params.item_type.as_deref().unwrap_or("album"))?;
         let quantity = params.quantity.unwrap_or(1);
         let origin = origin_from_url(params.item_url.as_deref());
@@ -170,7 +169,10 @@ impl BandcampServer {
                 return auth_required(self.client(), "no session cookie is loaded");
             }
             SessionStatus::Invalid => {
-                return auth_required(self.client(), "the saved session cookie is expired or invalid");
+                return auth_required(
+                    self.client(),
+                    "the saved session cookie is expired or invalid",
+                );
             }
             SessionStatus::Unknown(e) => {
                 tracing::warn!(error = %e, "could not verify session; attempting the add anyway");
@@ -192,9 +194,10 @@ impl BandcampServer {
                 tracing::warn!(%reason, "add_to_cart needs authentication");
                 auth_required(self.client(), &reason)
             }
-            Err(CartError::Other(e)) => {
-                Err(McpError::internal_error(format!("add to cart failed: {e}"), None))
-            }
+            Err(CartError::Other(e)) => Err(McpError::internal_error(
+                format!("add to cart failed: {e}"),
+                None,
+            )),
         }
     }
 }

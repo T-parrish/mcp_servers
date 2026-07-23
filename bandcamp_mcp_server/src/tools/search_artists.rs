@@ -57,7 +57,7 @@ impl BandcampServer {
         Parameters(params): Parameters<SearchArtistsParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self.search_artists_inner(params).await;
-        crate::metrics::record_tool_call("search_artists", crate::tools::outcome(&result));
+        mcp_core::metrics::record_tool_call("search_artists", crate::tools::outcome(&result));
         result
     }
 

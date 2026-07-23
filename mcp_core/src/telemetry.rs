@@ -18,6 +18,8 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
+use crate::ServiceInfo;
+
 /// Held for the lifetime of the process. Dropping it flushes buffered telemetry;
 /// without that the batch processor and periodic reader discard whatever they
 /// are still holding.
@@ -62,21 +64,24 @@ fn service_name_configured() -> bool {
 ///
 /// `Resource::builder` already picks up OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES,
 /// and setting the name explicitly would override them — so only fall back to the
-/// crate name when the operator has configured neither.
-fn resource() -> Resource {
+/// server's own name when the operator has configured neither. That fallback is
+/// what lets one shared `.env` serve several servers: each names itself.
+fn resource(service: &ServiceInfo) -> Resource {
     let mut builder = Resource::builder().with_attribute(opentelemetry::KeyValue::new(
         opentelemetry_semantic_conventions::attribute::SERVICE_VERSION,
-        env!("CARGO_PKG_VERSION"),
+        service.crate_version,
     ));
     if !service_name_configured() {
-        builder = builder.with_service_name(env!("CARGO_PKG_NAME"));
+        builder = builder.with_service_name(service.default_service_name);
     }
     builder.build()
 }
 
 /// Install the global subscriber and meter provider. Always logs to stderr;
 /// additionally exports spans and metrics over OTLP when configured.
-pub fn init() -> Result<Telemetry> {
+pub fn init(service: ServiceInfo) -> Result<Telemetry> {
+    crate::metrics::configure(&service);
+
     // Level is controlled by RUST_LOG (default: info).
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -91,7 +96,7 @@ pub fn init() -> Result<Telemetry> {
         Some(
             SdkTracerProvider::builder()
                 .with_batch_exporter(exporter)
-                .with_resource(resource())
+                .with_resource(resource(&service))
                 .build(),
         )
     } else {
@@ -101,15 +106,15 @@ pub fn init() -> Result<Telemetry> {
     // The OTel layer is only added when there is a tracer to feed it, so the
     // two arms produce different subscriber types; `Option<Layer>` unifies them.
     //
-    // The target filter exports only this crate's spans. Without it, rmcp's
+    // The target filter exports only the server crate's spans. Without it, rmcp's
     // `serve_inner` span — which lives for the whole stdio session — becomes the
     // root of every trace, so nothing is queryable until the client disconnects.
     // Excluding it makes each tool call its own complete trace, and also keeps
     // the SDK's own internal-log events from feeding back into the exporter.
     let otel_layer = tracer_provider.as_ref().map(|p| {
         tracing_opentelemetry::layer()
-            .with_tracer(p.tracer(env!("CARGO_PKG_NAME")))
-            .with_filter(Targets::new().with_target(env!("CARGO_PKG_NAME"), LevelFilter::TRACE))
+            .with_tracer(p.tracer(service.crate_name))
+            .with_filter(Targets::new().with_target(service.crate_name, LevelFilter::TRACE))
     });
     tracing_subscriber::registry()
         .with(filter)
@@ -130,7 +135,7 @@ pub fn init() -> Result<Telemetry> {
             .context("building the OTLP metric exporter")?;
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter)
-            .with_resource(resource())
+            .with_resource(resource(&service))
             .build();
         // The instruments in `crate::metrics` resolve through the global provider.
         opentelemetry::global::set_meter_provider(provider.clone());

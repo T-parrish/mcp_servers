@@ -4,6 +4,7 @@
     "allow": [
       "Read",
       "Update(*)",
+      "Write(*)",
       "Edit(/src/**)",
       "Bash(sed *)",
       "Bash(cargo build *)",

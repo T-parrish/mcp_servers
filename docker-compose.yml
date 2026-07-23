@@ -1,19 +1,21 @@
-# Local telemetry backend: Grafana + Tempo (traces) + Prometheus (metrics) + Loki,
-# pre-wired in one container.
+# Local telemetry backend shared by every MCP server in this repo: Grafana with
+# Tempo (traces), Prometheus (metrics) and Loki, pre-wired in one container.
 #
 #   UI    http://localhost:3000  (login admin/admin)
 #   OTLP  http://127.0.0.1:4318
 #
-# Start with `docker compose up -d`, then run the server with
-# OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 to send both signals here.
-# See README > Viewing telemetry locally.
+# Start it once from this directory with `docker compose up -d`, then run any of
+# the servers with OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 to send both
+# signals here. Give each one a distinct OTEL_SERVICE_NAME (e.g. bandcamp-mcp,
+# spotify-mcp) — that resource attribute is what keeps their traces and metrics
+# apart in Grafana. See each server's README > Viewing telemetry locally.
 #
 # Grafana's own docs call this a dev/demo image: storage is ephemeral and it is
 # not intended for production.
 services:
   lgtm:
     image: grafana/otel-lgtm:latest
-    container_name: bandcamp-mcp-lgtm
+    container_name: mcp-lgtm
     ports:
       - "3000:3000" # Grafana UI
       - "4318:4318" # OTLP/HTTP ingest
