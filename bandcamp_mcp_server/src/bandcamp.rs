@@ -7,12 +7,12 @@
 //! per-action logic (filtering, output shaping) lives in `crate::tools`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use mcp_core::ratelimit::RateLimiter;
 use serde::Deserialize;
-use tokio::sync::{Semaphore, SemaphorePermit};
 
 const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 const IDENTITY_URL: &str = "https://bandcamp.com/api/fan/2/collection_summary";
@@ -58,59 +58,6 @@ fn cookie_file_path() -> PathBuf {
     config_dir.join("bandcamp_mcp_server").join("cookie")
 }
 
-/// A small jitter in `[0, span/2]`, using the clock as cheap entropy so paced
-/// requests don't land on an exact grid.
-fn jitter(span: Duration) -> Duration {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    span.mul_f64((n as f64 / 1_000_000_000.0) * 0.5)
-}
-
-/// Bounds outbound requests: at most `max_concurrent` in flight, and request
-/// *starts* spaced at least `min_interval` (plus jitter) apart.
-struct RateLimiter {
-    semaphore: Semaphore,
-    min_interval: Duration,
-    /// Earliest instant the next request may start.
-    next_slot: Mutex<Instant>,
-}
-
-impl RateLimiter {
-    fn new(max_concurrent: usize, min_interval: Duration) -> Self {
-        Self {
-            semaphore: Semaphore::new(max_concurrent),
-            min_interval,
-            next_slot: Mutex::new(Instant::now()),
-        }
-    }
-
-    /// Wait for a concurrency slot and the paced start time, returning a permit
-    /// that must be held for the duration of the request.
-    async fn acquire(&self) -> SemaphorePermit<'_> {
-        let waited_from = Instant::now();
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("rate-limiter semaphore is never closed");
-
-        // Reserve a paced start slot. The std mutex is dropped before awaiting.
-        let start_at = {
-            let mut slot = self.next_slot.lock().unwrap();
-            let start_at = (*slot).max(Instant::now());
-            *slot = start_at + self.min_interval + jitter(self.min_interval);
-            start_at
-        };
-        if let Some(delay) = start_at.checked_duration_since(Instant::now()) {
-            tokio::time::sleep(delay).await;
-        }
-        crate::metrics::record_rate_limiter_wait(waited_from.elapsed());
-        permit
-    }
-}
-
 /// Client holding a reusable HTTP connection pool plus cart auth state.
 pub struct BandcampClient {
     http: reqwest::Client,
@@ -137,17 +84,7 @@ impl BandcampClient {
 
         // Rate-limit config. Concurrency is the requested knob; the paced
         // interval is what actually prevents bursty hammering.
-        let max_concurrent = std::env::var("BANDCAMP_MAX_CONCURRENT_REQUESTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1);
-        let min_interval_ms = std::env::var("BANDCAMP_MIN_REQUEST_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(750);
-        tracing::info!(max_concurrent, min_interval_ms, "configured request rate limiter");
-        let limiter = RateLimiter::new(max_concurrent, Duration::from_millis(min_interval_ms));
+        let limiter = RateLimiter::from_env("BANDCAMP", 1, 750);
 
         let cookie_file = cookie_file_path();
         // Startup load: env var wins, then the cached file.
@@ -208,10 +145,8 @@ impl BandcampClient {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.cookie_file,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.cookie_file, std::fs::Permissions::from_mode(0o600));
         }
         *self.cookie.write().unwrap() = Some(cookie.to_string());
         tracing::info!(cookie_file = %self.cookie_file.display(), "saved bandcamp session cookie");
@@ -250,15 +185,22 @@ impl BandcampClient {
             Ok(r) => r,
             Err(e) => {
                 span.record("otel.status_code", "error");
-                crate::metrics::record_request("GET", "bandcamp.com", None, started.elapsed());
+                mcp_core::metrics::record_request(
+                    "GET",
+                    "bandcamp.com",
+                    None,
+                    None,
+                    started.elapsed(),
+                );
                 return SessionStatus::Unknown(e.to_string());
             }
         };
         let status = resp.status();
         span.record("http.response.status_code", status.as_u16());
-        crate::metrics::record_request(
+        mcp_core::metrics::record_request(
             "GET",
             "bandcamp.com",
+            None,
             Some(status.as_u16()),
             started.elapsed(),
         );
@@ -272,10 +214,10 @@ impl BandcampClient {
         if json.get("error").and_then(|v| v.as_bool()).unwrap_or(false) {
             return SessionStatus::Invalid;
         }
-        let fan_id = json
-            .get("fan_id")
-            .and_then(|v| v.as_i64())
-            .or_else(|| json.pointer("/collection_summary/fan_id").and_then(|v| v.as_i64()));
+        let fan_id = json.get("fan_id").and_then(|v| v.as_i64()).or_else(|| {
+            json.pointer("/collection_summary/fan_id")
+                .and_then(|v| v.as_i64())
+        });
         SessionStatus::Valid { fan_id }
     }
 
@@ -283,12 +225,11 @@ impl BandcampClient {
     /// profile. On macOS this decrypts values via the Keychain, which triggers a
     /// one-time "Allow" prompt. The blocking read runs off the async runtime.
     pub(crate) async fn fetch_browser_cookie(&self) -> anyhow::Result<String> {
-        let cookies = tokio::task::spawn_blocking(|| {
-            rookie::chrome(Some(vec!["bandcamp.com".to_string()]))
-        })
-        .await
-        .context("browser cookie read task failed")?
-        .map_err(|e| anyhow::anyhow!("reading Chrome cookies failed: {e}"))?;
+        let cookies =
+            tokio::task::spawn_blocking(|| rookie::chrome(Some(vec!["bandcamp.com".to_string()])))
+                .await
+                .context("browser cookie read task failed")?
+                .map_err(|e| anyhow::anyhow!("reading Chrome cookies failed: {e}"))?;
 
         if cookies.is_empty() {
             anyhow::bail!(
@@ -344,20 +285,29 @@ impl BandcampClient {
             .http
             .post(&url)
             .header(reqwest::header::COOKIE, cookie)
-            .header(reqwest::header::ACCEPT, "application/json, text/javascript, */*; q=0.01")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/javascript, */*; q=0.01",
+            )
             .header("X-Requested-With", "XMLHttpRequest")
             .form(form)
             .send()
             .await
             .map_err(|e| {
                 span.record("otel.status_code", "error");
-                crate::metrics::record_request("POST", &host, None, started.elapsed());
+                mcp_core::metrics::record_request("POST", &host, None, None, started.elapsed());
                 CartError::Other(anyhow::Error::new(e).context("cart request failed"))
             })?;
 
         let status = resp.status();
         span.record("http.response.status_code", status.as_u16());
-        crate::metrics::record_request("POST", &host, Some(status.as_u16()), started.elapsed());
+        mcp_core::metrics::record_request(
+            "POST",
+            &host,
+            None,
+            Some(status.as_u16()),
+            started.elapsed(),
+        );
         let text = resp.text().await.unwrap_or_default();
         let snippet: String = text.chars().take(400).collect();
 
@@ -429,15 +379,22 @@ impl BandcampClient {
             .send()
             .await
             .inspect_err(|_| {
-                crate::metrics::record_request("POST", "bandcamp.com", None, started.elapsed());
+                mcp_core::metrics::record_request(
+                    "POST",
+                    "bandcamp.com",
+                    None,
+                    None,
+                    started.elapsed(),
+                );
             })
             .context("request to bandcamp failed")?;
 
         let status = resp.status();
         tracing::Span::current().record("http.response.status_code", status.as_u16());
-        crate::metrics::record_request(
+        mcp_core::metrics::record_request(
             "POST",
             "bandcamp.com",
+            None,
             Some(status.as_u16()),
             started.elapsed(),
         );

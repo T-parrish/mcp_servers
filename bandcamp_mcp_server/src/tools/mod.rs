@@ -15,11 +15,9 @@ mod authenticate;
 mod search_artists;
 mod search_songs;
 
-use rmcp::{
-    ErrorData as McpError,
-    handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, Content},
-};
+use rmcp::handler::server::router::tool::ToolRouter;
+
+pub(crate) use mcp_core::tools::{json_result, outcome};
 
 use crate::server::BandcampServer;
 
@@ -29,18 +27,4 @@ pub(crate) fn router() -> ToolRouter<BandcampServer> {
         + BandcampServer::search_songs_router()
         + BandcampServer::add_to_cart_router()
         + BandcampServer::authenticate_router()
-}
-
-/// The `outcome` metric attribute for a handler's return value. Note that a
-/// tool result carrying an in-band failure (e.g. `auth_required`) is still `ok`
-/// here — this tracks protocol-level errors.
-pub(crate) fn outcome(result: &Result<CallToolResult, McpError>) -> &'static str {
-    if result.is_ok() { "ok" } else { "error" }
-}
-
-/// Serialize a value to a pretty-JSON tool result. Shared by all actions.
-pub(crate) fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|e| McpError::internal_error(format!("failed to serialize result: {e}"), None))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
 }

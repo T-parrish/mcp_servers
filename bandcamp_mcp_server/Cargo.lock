@@ -295,7 +295,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenv",
- "mcp_core",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "reqwest",
  "rmcp",
  "rookie",
@@ -304,6 +307,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1629,24 +1634,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp_core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,17 +2756,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2850,26 +2826,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spotify_mcp_server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "dotenv",
- "mcp_core",
- "opentelemetry",
- "rand 0.9.5",
- "reqwest",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
 ]
 
 [[package]]

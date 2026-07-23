@@ -64,7 +64,7 @@ impl BandcampServer {
         Parameters(params): Parameters<SearchSongsParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self.search_songs_inner(params).await;
-        crate::metrics::record_tool_call("search_songs", crate::tools::outcome(&result));
+        mcp_core::metrics::record_tool_call("search_songs", crate::tools::outcome(&result));
         result
     }
 

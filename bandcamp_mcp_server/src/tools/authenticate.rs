@@ -35,9 +35,11 @@ pub struct AuthenticateParams {
 
 #[tool_router(router = authenticate_router, vis = "pub")]
 impl BandcampServer {
-    #[tool(description = "Check Bandcamp authentication status, or set a session cookie for cart \
+    #[tool(
+        description = "Check Bandcamp authentication status, or set a session cookie for cart \
                           operations. Pass `from_browser:true` to pull the cookie from Chrome \
-                          automatically, or `cookie` to set it manually; omit both to see status.")]
+                          automatically, or `cookie` to set it manually; omit both to see status."
+    )]
     // `skip_all`: the params carry a session cookie, which must never reach a span.
     #[tracing::instrument(
         name = "tools/call authenticate",
@@ -54,7 +56,7 @@ impl BandcampServer {
         Parameters(params): Parameters<AuthenticateParams>,
     ) -> Result<CallToolResult, McpError> {
         let result = self.authenticate_inner(params).await;
-        crate::metrics::record_tool_call("authenticate", crate::tools::outcome(&result));
+        mcp_core::metrics::record_tool_call("authenticate", crate::tools::outcome(&result));
         result
     }
 
@@ -83,9 +85,9 @@ impl BandcampServer {
                 }
             }
         } else if let Some(cookie) = params.cookie {
-            client
-                .save_cookie(&cookie)
-                .map_err(|e| McpError::invalid_params(format!("could not save cookie: {e}"), None))?;
+            client.save_cookie(&cookie).map_err(|e| {
+                McpError::invalid_params(format!("could not save cookie: {e}"), None)
+            })?;
         }
 
         // Verify against Bandcamp so "authenticated" reflects a real logged-in session.
