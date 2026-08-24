@@ -3,3 +3,6 @@
 # Local environment config — holds credentials (Spotify client ID, Bandcamp
 # session cookie). Never commit.
 .env
+
+# Per-server logs written by `./run.sh both`.
+/logs
