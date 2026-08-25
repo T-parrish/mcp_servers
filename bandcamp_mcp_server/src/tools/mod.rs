@@ -12,6 +12,7 @@
 
 mod add_to_cart;
 mod authenticate;
+mod find_purchase_options;
 mod search_artists;
 mod search_songs;
 
@@ -27,4 +28,5 @@ pub(crate) fn router() -> ToolRouter<BandcampServer> {
         + BandcampServer::search_songs_router()
         + BandcampServer::add_to_cart_router()
         + BandcampServer::authenticate_router()
+        + BandcampServer::find_purchase_options_router()
 }

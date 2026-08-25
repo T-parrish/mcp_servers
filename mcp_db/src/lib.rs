@@ -13,6 +13,7 @@
 //! let service = SpotifyServer::new(db).serve(stdio()).await?;
 //! ```
 
+pub mod purchase_options;
 pub mod songs;
 
 use std::time::Duration;
@@ -21,6 +22,7 @@ use anyhow::Context;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_postgres::PgPoolOptions;
 
+pub use purchase_options::{NewPurchaseOption, find_song_id, insert_purchase_options};
 pub use songs::{NewSong, insert_songs};
 pub use sqlx_postgres::PgPool;
 

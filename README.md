@@ -6,7 +6,7 @@ A Cargo workspace of [MCP](https://modelcontextprotocol.io) servers written in R
 | Crate | What it is |
 |-------|------------|
 | [`spotify_mcp_server`](spotify_mcp_server) | Log in via OAuth (PKCE), list your playlists, list a playlist's tracks, save its songs. Official Spotify Web API. |
-| [`bandcamp_mcp_server`](bandcamp_mcp_server) | Search artists and songs, add to cart. Bandcamp's undocumented internal API. |
+| [`bandcamp_mcp_server`](bandcamp_mcp_server) | Search artists and songs, record where a library song can be bought, add to cart. Bandcamp's undocumented internal API. |
 | [`mcp_core`](mcp_core) | Library shared by both servers: telemetry setup, OpenTelemetry instruments, the outbound rate limiter, and tool-result helpers. |
 | [`mcp_db`](mcp_db) | Library shared by both servers: the Postgres pool, the schema, and the writes. |
 
@@ -128,7 +128,11 @@ Two tables:
 - **`purchase_options`** — where a song can be bought, one row appended per search, so the history
   (including how a price moved) is kept. `song_id` references `songs`, many-to-one. Each row carries
   the platform, when it was searched, the URL, whether it has been purchased, and the price with its
-  currency. Nothing writes to this table yet — that comes with the Bandcamp/Beatport matching.
+  currency. Written by the Bandcamp server's `find_purchase_options`, which takes a song's artist
+  and title, requires that song to already be in `songs`, and appends a row per Bandcamp hit — plus
+  a row with a NULL `url` when a search finds nothing, so "looked and found nothing" is
+  distinguishable from "never looked". `price` and `currency` stay NULL for now: Bandcamp's search
+  endpoint does not report a price, and filling them would mean fetching each item's page.
 
 The current state of a song on each platform is the most recent row per platform:
 

@@ -28,7 +28,17 @@ async fn main() -> Result<()> {
     }
     tracing::info!("starting bandcamp MCP server (stdio transport)");
 
-    let service = BandcampServer::new()
+    // `None` when DATABASE_URL is unset: searching Bandcamp needs no database,
+    // and only `find_purchase_options` will object. A database that *is*
+    // configured but unreachable or unmigrated still stops startup.
+    let db = mcp_db::connect()
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "database unavailable"))?;
+    if db.is_none() {
+        tracing::warn!("DATABASE_URL is not set; `find_purchase_options` will refuse to run");
+    }
+
+    let service = BandcampServer::new(db)
         .serve(stdio())
         .await
         .inspect_err(|e| tracing::error!(error = %e, "failed to start server"))?;
