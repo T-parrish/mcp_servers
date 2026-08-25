@@ -1,5 +1,9 @@
-# Local telemetry backend shared by every MCP server in this repo: Grafana with
-# Tempo (traces), Prometheus (metrics) and Loki, pre-wired in one container.
+# Local backing services shared by every MCP server in this repo: the telemetry
+# stack (`lgtm`) and the Postgres the servers persist songs to (`postgres`).
+# Start them together with `docker compose up -d`, or one at a time by name.
+#
+# `lgtm` is Grafana with Tempo (traces), Prometheus (metrics) and Loki, pre-wired
+# in one container.
 #
 #   UI    http://localhost:3000  (login admin/admin)
 #   OTLP  http://127.0.0.1:4318
@@ -20,3 +24,52 @@ services:
       - "3000:3000" # Grafana UI
       - "4318:4318" # OTLP/HTTP ingest
     restart: unless-stopped
+
+  # Songs retrieved from Spotify, and where they can be bought. The servers find
+  # it through DATABASE_URL in `.env`; the schema is applied by `sqlx migrate`,
+  # which `./run.sh` invokes on every launch. Credentials are deliberately
+  # trivial — this listens on localhost for local development only.
+  postgres:
+    image: postgres:17-alpine
+    container_name: mcp-postgres
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp
+      POSTGRES_DB: mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume, so the data outlives `docker compose down` (unlike lgtm's).
+      - mcp-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp -d mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # A second, deliberately disposable Postgres for `cargo test`. Separate from
+  # `postgres` so the tests — which drop databases and delete rows — have no
+  # route to a real library: they read TEST_DATABASE_URL, never DATABASE_URL,
+  # and refuse to run if the two agree. Storage is tmpfs, so nothing it holds
+  # survives the container, and the port differs to make a mix-up obvious.
+  postgres-test:
+    image: postgres:17-alpine
+    container_name: mcp-postgres-test
+    environment:
+      POSTGRES_USER: mcp
+      POSTGRES_PASSWORD: mcp
+      POSTGRES_DB: mcp
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp -d mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mcp-postgres-data:

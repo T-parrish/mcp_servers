@@ -19,6 +19,11 @@
 # and metrics have somewhere to land (the server still needs
 # OTEL_EXPORTER_OTLP_ENDPOINT set, as it is in .env).
 #
+# When DATABASE_URL is configured, pending migrations are applied before every
+# launch, so a server started this way never meets an unmigrated database. That
+# needs sqlx-cli:
+#   cargo install sqlx-cli --no-default-features --features postgres,rustls
+#
 # Build first: cargo build --release
 set -e
 cd "$(dirname "$0")"
@@ -36,8 +41,31 @@ start_telemetry() {
     echo "run.sh: starting telemetry stack..." >&2
     # Output to stderr so it never touches stdout (the MCP protocol stream). A
     # failure is non-fatal: the server still starts, export just has nowhere to go.
-    docker compose up -d >&2 || echo "run.sh: could not start the telemetry stack" >&2
+    docker compose up -d lgtm >&2 || echo "run.sh: could not start the telemetry stack" >&2
   fi
+}
+
+# Apply any pending migration before a server starts, so the schema is never
+# behind the binary that is about to use it. Best-effort on purpose: the server
+# itself verifies the schema on startup and refuses to run without it, so that
+# error belongs there rather than duplicated here in a worse form.
+run_migrations() {
+  # Persistence is opt-in: with no DATABASE_URL anywhere there is nothing to
+  # migrate, and only `save_playlist_songs` will mind. sqlx-cli reads `.env`
+  # itself, so check both places it could come from.
+  if [ -z "$DATABASE_URL" ] && ! grep -qs '^[[:space:]]*DATABASE_URL=' .env; then
+    echo "run.sh: no DATABASE_URL; skipping migrations (saving songs will be unavailable)" >&2
+    return
+  fi
+  if ! command -v sqlx >/dev/null 2>&1; then
+    echo "run.sh: sqlx-cli not installed; skipping migrations" >&2
+    echo "run.sh:   cargo install sqlx-cli --no-default-features --features postgres,rustls" >&2
+    return
+  fi
+  echo "run.sh: applying database migrations..." >&2
+  # stdout would otherwise land in the MCP protocol stream.
+  sqlx migrate run --source mcp_db/migrations >&2 ||
+    echo "run.sh: migrations failed; the server will report why" >&2
 }
 
 binary_for() {
@@ -112,6 +140,7 @@ if [ -z "$server" ]; then
 fi
 
 [ "$telemetry" -eq 1 ] && start_telemetry
+run_migrations
 
 if [ "$server" = "both" ]; then
   run_both

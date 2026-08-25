@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 mcp_core.workspace = true
+mcp_db.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 reqwest.workspace = true

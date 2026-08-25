@@ -5,9 +5,10 @@ A Cargo workspace of [MCP](https://modelcontextprotocol.io) servers written in R
 
 | Crate | What it is |
 |-------|------------|
-| [`spotify_mcp_server`](spotify_mcp_server) | Log in via OAuth (PKCE), list your playlists, list a playlist's tracks. Official Spotify Web API. |
+| [`spotify_mcp_server`](spotify_mcp_server) | Log in via OAuth (PKCE), list your playlists, list a playlist's tracks, save its songs. Official Spotify Web API. |
 | [`bandcamp_mcp_server`](bandcamp_mcp_server) | Search artists and songs, add to cart. Bandcamp's undocumented internal API. |
 | [`mcp_core`](mcp_core) | Library shared by both servers: telemetry setup, OpenTelemetry instruments, the outbound rate limiter, and tool-result helpers. |
+| [`mcp_db`](mcp_db) | Library shared by both servers: the Postgres pool, the schema, and the writes. |
 
 Each server has its own README with tools, authentication and configuration — this file covers only
 what the workspace shares.
@@ -45,13 +46,105 @@ server ignores the others' variables.
 binary defaults `service.name` to its own name (`spotify-mcp` / `bandcamp-mcp`). Set it only to
 override a single server for a one-off run.
 
+## Persistence
+
+Songs are recorded in Postgres, so that finding them on other stores later does not mean listing the
+playlist again. Reading and saving are separate tools: `list_playlist_tracks` only reads, and
+`save_playlist_songs` records a playlist's songs. Splitting them means a database problem can never
+cost you a Spotify request you already made, and the server is fully usable with no database at all.
+
+`save_playlist_songs` takes a playlist reference and fetches the tracks itself rather than accepting
+track data — routing that through the assistant would be slower, more expensive, and corruptible,
+and a paraphrased title becomes a wrong row that nothing downstream can detect.
+
+`docker-compose.yml` runs a Postgres:
+
+```sh
+docker compose up -d postgres     # listens on 127.0.0.1:5432
+```
+
+Point the servers at it with `DATABASE_URL` in `.env` (the value in `.env.example` matches the
+container). It is **optional**: unset, the server starts normally and only `save_playlist_songs`
+refuses, naming the variable. But a database that *is* configured and turns out to be unreachable or
+unmigrated stops startup — an absent database is a choice, a broken one is a misconfiguration worth
+hearing about immediately. For the same reason a failed write fails the tool call rather than being
+logged and dropped: a save that quietly did nothing is exactly what the tool exists to make visible.
+
+### Migrations
+
+The schema lives in [`mcp_db/migrations`](mcp_db/migrations) and is applied by
+[`sqlx-cli`](https://crates.io/crates/sqlx-cli), which must match the `sqlx` version in
+`Cargo.toml`:
+
+```sh
+cargo install sqlx-cli --no-default-features --features postgres,rustls
+```
+
+`./run.sh` applies pending migrations on every launch (skipping this when no `DATABASE_URL` is
+configured), so a server started through the wrapper never meets an unmigrated database. To do it by
+hand — or when starting a binary directly:
+
+```sh
+sqlx migrate run --source mcp_db/migrations      # apply
+sqlx migrate info --source mcp_db/migrations     # what has been applied
+sqlx migrate add --source mcp_db/migrations <name>   # author the next one
+```
+
+A new migration is just a new file in that directory; nothing in the Rust code needs to know about
+it. Migrations are checksummed once applied, so never edit one that has already run.
+
+### Tests
+
+The database tests need Postgres, and get their own — a second, disposable server so they can never
+reach a real library:
+
+```sh
+docker compose up -d postgres-test     # tmpfs storage, listens on :5433
+cargo test -p mcp_db
+```
+
+The isolation is structural rather than a rule to remember. The test harness reads
+`TEST_DATABASE_URL` and **never** `DATABASE_URL`, and panics before touching anything if the two
+name the same database. Each test then creates its own `mcp_test_<random>` database, applies the
+migrations to it, and drops it at the end, so tests cannot see each other's rows or leave anything
+behind. With `TEST_DATABASE_URL` unset they skip and pass, which is what makes a plain
+`cargo test` safe anywhere.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `fmt`, `clippy`, the full test
+suite against a Postgres service container, and a separate check that the migrations still apply
+through `sqlx-cli` — the path `run.sh` uses.
+
+### Schema
+
+Two tables:
+
+- **`songs`** — one row per song. A song is identified by its *normalized* lead artist and title
+  (`artist_key`, `title_key`: lower-cased, trimmed, internal whitespace collapsed), because the
+  stores this is meant to be matched against share no identifier with Spotify — only the text.
+  Those two columns are `GENERATED ALWAYS`, so the keys cannot disagree with the values they come
+  from. Re-listing a playlist inserts nothing new: the write is `ON CONFLICT DO NOTHING`, and an
+  existing row is never modified. `spotify_id` and `isrc` are recorded alongside for a future
+  matcher that can do better than text.
+- **`purchase_options`** — where a song can be bought, one row appended per search, so the history
+  (including how a price moved) is kept. `song_id` references `songs`, many-to-one. Each row carries
+  the platform, when it was searched, the URL, whether it has been purchased, and the price with its
+  currency. Nothing writes to this table yet — that comes with the Bandcamp/Beatport matching.
+
+The current state of a song on each platform is the most recent row per platform:
+
+```sql
+SELECT DISTINCT ON (song_id, platform) *
+FROM purchase_options
+ORDER BY song_id, platform, searched_at DESC;
+```
+
 ## Telemetry
 
 `docker-compose.yml` runs one [`grafana/otel-lgtm`](https://github.com/grafana/docker-otel-lgtm)
 container (Grafana + Tempo + Prometheus + Loki) shared by every server:
 
 ```sh
-docker compose up -d               # Grafana at http://localhost:3000 (admin/admin), OTLP on :4318
+docker compose up -d lgtm          # Grafana at http://localhost:3000 (admin/admin), OTLP on :4318
 ```
 
 Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` (already in `.env.example`) and the servers
