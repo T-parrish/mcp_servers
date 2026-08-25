@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on a warning here rather than letting them accumulate.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    services:
+      # The database the integration tests create and drop their own databases
+      # on. `DATABASE_URL` is deliberately not set for the test step: the tests
+      # read TEST_DATABASE_URL and refuse to run against a database that
+      # `DATABASE_URL` also names, so leaving it unset there keeps that
+      # impossible. The migration step below sets it, scoped to itself, and
+      # only after the tests have run.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: mcp
+          POSTGRES_PASSWORD: mcp
+          POSTGRES_DB: mcp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mcp -d mcp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # `rookie` builds a bundled SQLite from source, so the whole workspace is
+      # expensive to compile cold; this is the difference between a fast job and
+      # a slow one.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Runs the database tests too: TEST_DATABASE_URL is set, so they no longer
+      # skip. Each creates and drops its own database on the service above.
+      - name: Tests
+        env:
+          TEST_DATABASE_URL: postgres://mcp:mcp@127.0.0.1:5432/mcp
+        run: cargo test --workspace
+
+      # The tests apply the migrations themselves, so this checks the other
+      # path — the one `run.sh` uses — still works against a clean database.
+      - name: Migrations apply via sqlx-cli
+        env:
+          DATABASE_URL: postgres://mcp:mcp@127.0.0.1:5432/mcp
+        run: |
+          cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
+          sqlx migrate run --source mcp_db/migrations
+          sqlx migrate info --source mcp_db/migrations

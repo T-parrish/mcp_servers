@@ -30,7 +30,17 @@ async fn main() -> Result<()> {
     }
     tracing::info!("starting spotify MCP server (stdio transport)");
 
-    let service = SpotifyServer::new()
+    // `None` when DATABASE_URL is unset: reading playlists needs no database,
+    // and only `save_playlist_songs` will object. A database that *is*
+    // configured but unreachable or unmigrated still stops startup.
+    let db = mcp_db::connect()
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "database unavailable"))?;
+    if db.is_none() {
+        tracing::warn!("DATABASE_URL is not set; `save_playlist_songs` will refuse to run");
+    }
+
+    let service = SpotifyServer::new(db)
         .serve(stdio())
         .await
         .inspect_err(|e| tracing::error!(error = %e, "failed to start server"))?;

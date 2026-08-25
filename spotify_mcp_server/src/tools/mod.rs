@@ -2,6 +2,7 @@
 //!
 //! Each submodule defines one action — its parameter struct, its output type,
 //! and its `#[tool]` handler — as a named tool router on [`SpotifyServer`].
+//! [`playlist`] is the exception: it holds what the two playlist actions share.
 //!
 //! # Adding a new action
 //! 1. Create `tools/<action>.rs` with a
@@ -13,6 +14,8 @@
 mod authenticate;
 mod list_playlist_tracks;
 mod list_playlists;
+mod playlist;
+mod save_playlist_songs;
 
 use rmcp::{
     ErrorData as McpError, handler::server::router::tool::ToolRouter, model::CallToolResult,
@@ -29,6 +32,7 @@ pub(crate) fn router() -> ToolRouter<SpotifyServer> {
     SpotifyServer::authenticate_router()
         + SpotifyServer::list_playlists_router()
         + SpotifyServer::list_playlist_tracks_router()
+        + SpotifyServer::save_playlist_songs_router()
 }
 
 /// Turn a client error into either an in-band `auth_required` result — which

@@ -1,0 +1,15 @@
+[package]
+name = "mcp_db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sqlx-core.workspace = true
+sqlx-postgres.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+dotenv.workspace = true
+url.workspace = true

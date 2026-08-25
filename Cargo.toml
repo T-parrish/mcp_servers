@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["mcp_core", "bandcamp_mcp_server", "spotify_mcp_server"]
+members = ["mcp_core", "mcp_db", "bandcamp_mcp_server", "spotify_mcp_server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ edition = "2024"
 # whole workspace compiles them once into the shared `target/`.
 [workspace.dependencies]
 mcp_core = { path = "mcp_core" }
+mcp_db = { path = "mcp_db" }
 rmcp = { version = "0.9", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal", "sync", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "charset", "http2", "rustls", "system-proxy"] }
@@ -21,10 +22,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 dotenv = "0.15.0"
+# The `sqlx` facade crate is deliberately not used: it declares an optional
+# SQLite backend whose `libsqlite3-sys` version Cargo cannot reconcile with the
+# one `rookie` pulls in for the bandcamp server, and `links` conflicts are
+# resolved across the whole graph whether or not the feature is enabled.
+sqlx-core = { version = "0.9", default-features = false, features = ["migrate", "_rt-tokio"] }
+sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate"] }
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
 rookie = "0.5.6"
+url = "2"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "internal-logs"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace", "metrics", "internal-logs"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-rustls", "reqwest-blocking-client", "internal-logs"] }
