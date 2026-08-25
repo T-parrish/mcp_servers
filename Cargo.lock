@@ -311,6 +311,7 @@ dependencies = [
  "anyhow",
  "dotenv",
  "mcp_core",
+ "mcp_db",
  "reqwest",
  "rmcp",
  "rookie",
