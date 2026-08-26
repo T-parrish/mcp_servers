@@ -18,6 +18,30 @@ const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocom
 const IDENTITY_URL: &str = "https://bandcamp.com/api/fan/2/collection_summary";
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; bandcamp_mcp_server/0.1)";
 
+/// The origin every cart request goes to unless a caller supplies a more
+/// specific (and validated) Bandcamp origin.
+pub(crate) const DEFAULT_CART_ORIGIN: &str = "https://bandcamp.com";
+
+/// Normalize a caller-supplied URL or origin to an `https://<host>` origin on
+/// Bandcamp, or `None` if it points anywhere else.
+///
+/// Cart requests carry the full session cookie and their target is derived from
+/// model-supplied tool input, so anything that is not `bandcamp.com` or a
+/// `*.bandcamp.com` artist subdomain must never become a target. `http` URLs are
+/// upgraded to `https`; port and userinfo are dropped.
+pub(crate) fn bandcamp_origin(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return None;
+    }
+    // A trailing dot ("bandcamp.com.") is the same host to DNS but not to `==`.
+    let host = parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (host == "bandcamp.com" || host.ends_with(".bandcamp.com")).then(|| format!("https://{host}"))
+}
+
 /// Why a cart request could not be completed.
 pub(crate) enum CartError {
     /// The session cookie is missing or was rejected — re-authentication needed.
@@ -269,6 +293,15 @@ impl BandcampClient {
         form: &[(&str, String)],
     ) -> Result<serde_json::Value, CartError> {
         let span = tracing::Span::current();
+        // Checked here rather than in the caller so that no tool can route a
+        // cookie-bearing request to an origin it chose. This runs before the
+        // cookie is even read.
+        let origin = bandcamp_origin(origin).ok_or_else(|| {
+            span.record("otel.status_code", "error");
+            CartError::Other(anyhow::anyhow!(
+                "refusing to send the session cookie to non-bandcamp origin {origin:?}"
+            ))
+        })?;
         let cookie = self.cookie.read().unwrap().clone().ok_or_else(|| {
             span.record("otel.status_code", "error");
             CartError::AuthRequired("no session cookie is loaded".to_string())
@@ -444,4 +477,61 @@ pub(crate) struct RawResult {
     pub(crate) location: Option<String>,
     pub(crate) item_url_path: Option<String>,
     pub(crate) item_url_root: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bandcamp_origin;
+
+    #[test]
+    fn accepts_bandcamp_hosts() {
+        assert_eq!(
+            bandcamp_origin("https://bandcamp.com/cart"),
+            Some("https://bandcamp.com".to_string())
+        );
+        assert_eq!(
+            bandcamp_origin("https://naibu.bandcamp.com/track/x"),
+            Some("https://naibu.bandcamp.com".to_string())
+        );
+        // Case and a trailing dot still name the same host.
+        assert_eq!(
+            bandcamp_origin("https://Naibu.Bandcamp.Com./track/x"),
+            Some("https://naibu.bandcamp.com".to_string())
+        );
+    }
+
+    #[test]
+    fn upgrades_http_to_https() {
+        assert_eq!(
+            bandcamp_origin("http://bandcamp.com/album/x"),
+            Some("https://bandcamp.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_lookalikes_and_other_hosts() {
+        for hostile in [
+            "https://bandcamp.com.evil.example/x",
+            "https://evil-bandcamp.com/x",
+            "https://notbandcamp.com/x",
+            "https://attacker.example/x",
+            "file:///etc/passwd",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(
+                bandcamp_origin(hostile),
+                None,
+                "`{hostile}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn drops_port_and_userinfo() {
+        assert_eq!(
+            bandcamp_origin("https://user:pass@bandcamp.com:8443/cart"),
+            Some("https://bandcamp.com".to_string())
+        );
+    }
 }
