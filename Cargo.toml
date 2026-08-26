@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["mcp_core", "mcp_db", "bandcamp_mcp_server", "spotify_mcp_server"]
+members = ["mcp_core", "mcp_db", "mcp_db/sqlx_shim", "bandcamp_mcp_server", "spotify_mcp_server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,6 +28,10 @@ dotenv = "0.15.0"
 # resolved across the whole graph whether or not the feature is enabled.
 sqlx-core = { version = "0.9", default-features = false, features = ["migrate", "_rt-tokio"] }
 sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate"] }
+# `sqlx-macros` on its own has no SQLite backend to declare, so `migrate!` is
+# still available to `mcp_db` — via `mcp_db/sqlx_shim`, which supplies the
+# `::sqlx::` paths the macro expands to. See that crate's docs.
+sqlx-macros = { version = "0.9", default-features = false, features = ["migrate", "postgres", "_rt-tokio"] }
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"

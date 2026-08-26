@@ -9,8 +9,6 @@
 //! applies the migrations to it, and drops it again in [`TestDb::cleanup`], so
 //! tests cannot see each other's rows or leave anything behind.
 
-use std::path::Path;
-
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::raw_sql::raw_sql;
 use sqlx_core::sql_str::AssertSqlSafe;
@@ -99,34 +97,17 @@ impl TestDb {
     }
 }
 
-/// Apply every migration, in filename order.
+/// Apply every migration, exactly the way `sqlx migrate run` does.
 ///
-/// Reads the directory rather than listing the files here, so adding a
-/// migration stays a matter of adding one file — the same property the servers
-/// get from `sqlx migrate run`.
+/// The crate's own embedded migrator rather than a second reading of the
+/// directory: it is the same list `mcp_db::ensure_migrated` checks against, and
+/// running it records `_sqlx_migrations` the way sqlx-cli would, so a test
+/// database is indistinguishable from one `run.sh` migrated.
 async fn migrate(pool: &PgPool) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("mcp_db/migrations must exist")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-        .collect();
-    files.sort();
-    assert!(
-        !files.is_empty(),
-        "no migrations found in {}",
-        dir.display()
-    );
-
-    for file in files {
-        let sql = std::fs::read_to_string(&file).expect("could not read a migration");
-        // Safe by construction: these are files in this repository.
-        raw_sql(AssertSqlSafe(sql))
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("migration {} failed: {e}", file.display()));
-    }
+    mcp_db::MIGRATOR
+        .run(pool)
+        .await
+        .unwrap_or_else(|e| panic!("migrations failed: {e}"));
 }
 
 /// Refuse to run against whatever `DATABASE_URL` points at.

@@ -91,7 +91,10 @@ sqlx migrate add --source mcp_db/migrations <name>   # author the next one
 ```
 
 A new migration is just a new file in that directory; nothing in the Rust code needs to know about
-it. Migrations are checksummed once applied, so never edit one that has already run.
+it. `mcp_db` embeds the directory at compile time with `sqlx::migrate!` and `connect` compares that
+against the `_sqlx_migrations` table, so a server refuses to start against a database that is short a
+migration — even one that only adds an index — or against one whose applied migrations no longer
+match the files. Migrations are checksummed once applied, so never edit one that has already run.
 
 ### Tests
 

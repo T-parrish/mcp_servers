@@ -5,7 +5,10 @@ edition.workspace = true
 
 [dependencies]
 sqlx-core.workspace = true
+sqlx-macros.workspace = true
 sqlx-postgres.workspace = true
+# `migrate!` expands to `::sqlx::` paths; this is what they resolve to.
+sqlx = { package = "mcp_sqlx_shim", path = "sqlx_shim" }
 tracing.workspace = true
 anyhow.workspace = true
 
