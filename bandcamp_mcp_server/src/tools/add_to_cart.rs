@@ -17,7 +17,9 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::bandcamp::{BandcampClient, CartError, SessionStatus};
+use crate::bandcamp::{
+    BandcampClient, CartError, DEFAULT_CART_ORIGIN, SessionStatus, bandcamp_origin,
+};
 use crate::server::BandcampServer;
 use crate::tools::json_result;
 
@@ -55,15 +57,18 @@ fn item_type_code(input: &str) -> Result<&'static str, McpError> {
     }
 }
 
-/// Derive the `scheme://host` origin to post to from an optional item URL.
+/// Derive the `https://host` origin to post to from an optional item URL.
+///
+/// `item_url` is model-supplied, so anything that is not a Bandcamp origin falls
+/// back to the default rather than being used as a target.
 fn origin_from_url(item_url: Option<&str>) -> String {
-    item_url
-        .and_then(|u| reqwest::Url::parse(u).ok())
-        .and_then(|u| {
-            let scheme = u.scheme().to_string();
-            u.host_str().map(|h| format!("{scheme}://{h}"))
-        })
-        .unwrap_or_else(|| "https://bandcamp.com".to_string())
+    let Some(url) = item_url else {
+        return DEFAULT_CART_ORIGIN.to_string();
+    };
+    bandcamp_origin(url).unwrap_or_else(|| {
+        tracing::warn!(%url, "item_url is not a bandcamp URL; posting to the default origin");
+        DEFAULT_CART_ORIGIN.to_string()
+    })
 }
 
 /// An `auth_required` tool result telling the assistant to (re-)authenticate.
@@ -199,5 +204,45 @@ impl BandcampServer {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_from_url;
+
+    #[test]
+    fn keeps_bandcamp_origins() {
+        assert_eq!(
+            origin_from_url(Some("https://bandcamp.com/album/x")),
+            "https://bandcamp.com"
+        );
+        // Artist subdomains are where real item URLs live.
+        assert_eq!(
+            origin_from_url(Some("https://naibu.bandcamp.com/track/x")),
+            "https://naibu.bandcamp.com"
+        );
+    }
+
+    #[test]
+    fn falls_back_for_anything_else() {
+        // A poisoned search result or an injected instruction must not be able to
+        // aim the cookie-bearing cart POST somewhere else.
+        for hostile in [
+            "https://attacker.example/x",
+            "https://bandcamp.com.evil.example/x",
+            "not a url",
+        ] {
+            assert_eq!(origin_from_url(Some(hostile)), "https://bandcamp.com");
+        }
+        assert_eq!(origin_from_url(None), "https://bandcamp.com");
+    }
+
+    #[test]
+    fn upgrades_plaintext_bandcamp_urls() {
+        assert_eq!(
+            origin_from_url(Some("http://bandcamp.com/album/x")),
+            "https://bandcamp.com"
+        );
     }
 }
