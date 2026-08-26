@@ -110,8 +110,14 @@ pub struct SpotifyClient {
     limiter: RateLimiter,
     /// The current token set, refreshed in place and mirrored to `token_file`.
     tokens: RwLock<Option<Tokens>>,
+    /// Serializes token refreshes, so concurrent tool calls that all see an
+    /// expired token issue one refresh request between them rather than one
+    /// each. See [`SpotifyClient::refresh`].
+    refresh_lock: tokio::sync::Mutex<()>,
     /// Where the token set is persisted so it survives restarts.
     token_file: PathBuf,
+    /// The token endpoint. Always [`TOKEN_URL`] outside tests.
+    token_url: String,
     /// The registered application's client ID. Without it, no login is possible.
     client_id: Option<String>,
     /// Loopback URI the authorization redirect comes back to. Must match one
@@ -166,7 +172,9 @@ impl SpotifyClient {
             http,
             limiter,
             tokens: RwLock::new(tokens),
+            refresh_lock: tokio::sync::Mutex::new(()),
             token_file,
+            token_url: TOKEN_URL.to_string(),
             client_id,
             redirect_uri,
         }
@@ -240,7 +248,24 @@ impl SpotifyClient {
     }
 
     /// Swap the stored refresh token for a new access token.
+    ///
+    /// Single-flighted: Spotify rotates the refresh token on this flow, so two
+    /// concurrent refreshes with the same one would each be handed a different
+    /// successor and the loser's would be the one persisted — leaving a stored
+    /// refresh token Spotify has already superseded. Callers that arrive while a
+    /// refresh is in flight wait for it and take its result.
     async fn refresh(&self) -> Result<Tokens, ApiError> {
+        let _guard = self.refresh_lock.lock().await;
+
+        // Whoever held the lock may have already refreshed; their token is the
+        // current one, and asking for another would rotate this one out.
+        let current = self.tokens.read().unwrap().clone();
+        if let Some(tokens) = current
+            && !tokens.expired()
+        {
+            return Ok(tokens);
+        }
+
         let (refresh_token, previous_scope) = {
             let guard = self.tokens.read().unwrap();
             let tokens = guard
@@ -295,7 +320,7 @@ impl SpotifyClient {
             otel.name = "POST",
             otel.status_code = tracing::field::Empty,
             http.request.method = "POST",
-            url.full = TOKEN_URL,
+            url.full = %self.token_url,
             url.template = "/api/token",
             server.address = ACCOUNTS_HOST,
             http.response.status_code = tracing::field::Empty,
@@ -312,7 +337,7 @@ impl SpotifyClient {
         let started = Instant::now();
         let resp = self
             .http
-            .post(TOKEN_URL)
+            .post(&self.token_url)
             .form(form)
             .send()
             .await
@@ -579,4 +604,134 @@ struct Page<T> {
     items: Vec<T>,
     next: Option<String>,
     total: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A token endpoint that counts the requests it serves and hands each one a
+    /// distinct token pair, so a duplicate refresh is visible in both the count
+    /// and in which tokens the callers end up with.
+    ///
+    /// `delay` is how long a request is held open before answering — long enough
+    /// for every caller to have reached the refresh.
+    async fn mock_token_endpoint(delay: Duration) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+
+        let served = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    let n = served.fetch_add(1, Ordering::SeqCst) + 1;
+                    // The request is not inspected; one read is enough to let the
+                    // client finish writing it.
+                    let _ = socket.read(&mut [0u8; 4096]).await;
+                    tokio::time::sleep(delay).await;
+                    let body = format!(
+                        r#"{{"access_token":"access-{n}","refresh_token":"refresh-{n}","expires_in":3600,"scope":"{SCOPES}"}}"#
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/api/token"), requests)
+    }
+
+    /// A client wired to `token_url`, holding `tokens`, persisting to a token
+    /// file of its own.
+    fn test_client(token_url: String, tokens: Tokens) -> SpotifyClient {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let token_file = std::env::temp_dir().join(format!(
+            "spotify_mcp_test_{}_{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        SpotifyClient {
+            http: reqwest::Client::new(),
+            limiter: RateLimiter::new(4, Duration::ZERO),
+            tokens: RwLock::new(Some(tokens)),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            token_file,
+            token_url,
+            client_id: Some("test-client-id".to_string()),
+            redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
+        }
+    }
+
+    fn expired_tokens() -> Tokens {
+        Tokens {
+            access_token: "stale-access".to_string(),
+            refresh_token: Some("stored-refresh".to_string()),
+            // Inside the skew window, so `expired()` is true.
+            expires_at: now_secs(),
+            scope: SCOPES.to_string(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_refresh_once() {
+        let (token_url, requests) = mock_token_endpoint(Duration::from_millis(150)).await;
+        let client = Arc::new(test_client(token_url, expired_tokens()));
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.access_token().await.map_err(|e| e.to_string()) })
+            })
+            .collect();
+        let mut tokens = Vec::new();
+        for call in calls {
+            tokens.push(call.await.unwrap().expect("access token"));
+        }
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "one refresh between them"
+        );
+        // Every caller — not just the one that did the work — ends up with the
+        // token that refresh produced.
+        assert!(
+            tokens.iter().all(|t| t == "access-1"),
+            "callers disagreed on the access token: {tokens:?}"
+        );
+        // And the refresh token stored is the one Spotify handed back with it.
+        let stored = client.tokens.read().unwrap().clone().unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-1"));
+
+        let _ = std::fs::remove_file(client.token_file());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_valid_token_is_used_without_refreshing() {
+        let (token_url, requests) = mock_token_endpoint(Duration::ZERO).await;
+        let tokens = Tokens {
+            expires_at: now_secs() + 3600,
+            ..expired_tokens()
+        };
+        let client = test_client(token_url, tokens);
+
+        let token = client.access_token().await.map_err(|e| e.to_string());
+        assert_eq!(token.unwrap(), "stale-access");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(client.token_file());
+    }
 }
