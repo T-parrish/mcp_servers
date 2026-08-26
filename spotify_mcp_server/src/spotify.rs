@@ -419,6 +419,16 @@ impl SpotifyClient {
     )]
     async fn get<T: DeserializeOwned>(&self, route: &'static str, url: Url) -> Result<T, ApiError> {
         let span = tracing::Span::current();
+        // Checked here, where the bearer token is attached, rather than in the
+        // callers: `get_paged` takes its follow-up URLs out of a response body,
+        // so the destination is response-controlled unless it is verified. This
+        // runs before the token is read.
+        if !on_api_host(&url) {
+            span.record("otel.status_code", "error");
+            return Err(ApiError::Other(anyhow::anyhow!(
+                "refusing to send the access token to {url}; expected https://{API_HOST}"
+            )));
+        }
         let token = self.access_token().await?;
 
         for attempt in 0..2 {
@@ -559,6 +569,19 @@ impl Default for SpotifyClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `url` is an HTTPS URL on the Web API host.
+///
+/// Every request [`SpotifyClient::get`] makes carries the access token, and its
+/// paginated caller takes URLs from `next` in a response body, so the host is
+/// checked rather than trusted.
+fn on_api_host(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            // A trailing dot is the same host to DNS but not to a string compare.
+            .is_some_and(|h| h.trim_end_matches('.').eq_ignore_ascii_case(API_HOST))
 }
 
 /// Build an absolute Web API URL from a path and query parameters.
@@ -731,6 +754,72 @@ mod tests {
         let token = client.access_token().await.map_err(|e| e.to_string());
         assert_eq!(token.unwrap(), "stale-access");
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(client.token_file());
+    }
+
+    /// A listener that counts connections and answers nothing, standing in for
+    /// whatever host a `next` URL might name.
+    async fn rogue_endpoint() -> (Url, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let seen = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+
+        let url = Url::parse(&format!("http://{addr}/v1/me/playlists")).unwrap();
+        (url, hits)
+    }
+
+    #[test]
+    fn only_the_api_host_over_https_is_accepted() {
+        for ok in [
+            "https://api.spotify.com/v1/me",
+            "https://API.Spotify.Com./v1/me/playlists?limit=50",
+        ] {
+            assert!(on_api_host(&Url::parse(ok).unwrap()), "`{ok}` is the API");
+        }
+        for bad in [
+            // The shapes a `next` value could take if the response were not Spotify's.
+            "https://api.spotify.com.evil.example/v1/me",
+            "https://evil.example/v1/me",
+            "https://accounts.spotify.com/api/token",
+            // Cleartext to the right host still exposes the token on the wire.
+            "http://api.spotify.com/v1/me",
+        ] {
+            assert!(!on_api_host(&Url::parse(bad).unwrap()), "`{bad}` is not");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_off_host_url_never_receives_the_token() {
+        let (token_url, refreshes) = mock_token_endpoint(Duration::ZERO).await;
+        let (rogue, hits) = rogue_endpoint().await;
+        let client = test_client(token_url, expired_tokens());
+
+        let err = client
+            .get::<serde_json::Value>("/v1/me/playlists", rogue)
+            .await
+            .expect_err("an off-host URL must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing to send the access token"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the rogue host was contacted"
+        );
+        // The refusal lands before the token is read, so nothing was refreshed
+        // either — the tokens these credentials would come from stayed untouched.
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
 
         let _ = std::fs::remove_file(client.token_file());
     }
