@@ -4,7 +4,7 @@
 //! the migrations: those are plain files under `mcp_db/migrations`, applied by
 //! `sqlx-cli`, which `run.sh` invokes before starting a server. What this crate
 //! does instead is refuse to hand back a pool for a database that has not been
-//! migrated — see [`connect`].
+//! migrated — see [`connect`] and [`ensure_migrated`].
 //!
 //! A server opens the pool in `main` and passes it down:
 //!
@@ -19,6 +19,8 @@ pub mod songs;
 use std::time::Duration;
 
 use anyhow::Context;
+use sqlx_core::migrate::Migrator;
+use sqlx_core::query_as::query_as;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_postgres::PgPoolOptions;
 
@@ -26,10 +28,16 @@ pub use purchase_options::{NewPurchaseOption, find_song_id, insert_purchase_opti
 pub use songs::{NewSong, insert_songs};
 pub use sqlx_postgres::PgPool;
 
-/// The tables the servers write to. Their presence is what "migrated" means
-/// here; the authority on which migrations have run is `_sqlx_migrations`, but
-/// that table is `sqlx-cli`'s business, not this crate's.
-const REQUIRED_TABLES: [&str; 2] = ["songs", "purchase_options"];
+/// Every migration under `mcp_db/migrations`, embedded at compile time.
+///
+/// This is `sqlx::migrate!` — reached through `sqlx-macros` and the local
+/// `sqlx_shim` crate, because the `sqlx` facade cannot be depended on here (see
+/// the root `Cargo.toml`). Adding a migration is still just adding a file:
+/// nothing below names one.
+///
+/// Public so the tests can apply exactly what [`ensure_migrated`] checks
+/// for, rather than a second reading of the same directory.
+pub static MIGRATOR: Migrator = sqlx_macros::migrate!("./migrations");
 
 /// How to fix a database that is missing the schema.
 const MIGRATE_HINT: &str = "run `sqlx migrate run --source mcp_db/migrations` \
@@ -64,18 +72,69 @@ pub async fn connect() -> anyhow::Result<Option<PgPool>> {
              `docker compose up -d postgres` starts the local one",
         )?;
 
-    for table in REQUIRED_TABLES {
-        let exists: bool = query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(table)
-            .fetch_one(&pool)
-            .await
-            .context("could not inspect the database schema")?;
-        anyhow::ensure!(
-            exists,
-            "the database is missing the `{table}` table — {MIGRATE_HINT}"
-        );
-    }
+    ensure_migrated(&pool).await?;
 
     tracing::info!("database ready");
     Ok(Some(pool))
+}
+
+/// Fail unless every migration under `mcp_db/migrations` has been applied.
+///
+/// Both halves of the comparison are read rather than written down: what
+/// *should* have run is [`MIGRATOR`], resolved from the migration directory by
+/// `sqlx::migrate!`; what *has* run comes from `_sqlx_migrations`, which is
+/// `sqlx-cli`'s record. So a migration that only adds an index or alters a
+/// column is caught here rather than by the first query that needs it.
+///
+/// Because the migrator carries the SQL, this also catches a migration that was
+/// edited after it ran — a database whose schema no longer matches the files it
+/// was built from, which the version numbers alone cannot show.
+pub async fn ensure_migrated(pool: &PgPool) -> anyhow::Result<()> {
+    // `to_regclass` rather than an error code: an absent table is the ordinary
+    // state of a database sqlx-cli has never touched, not an exception.
+    let recorded: bool = query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .context("could not inspect the database schema")?;
+    let applied: Vec<(i64, Vec<u8>, bool)> = if recorded {
+        query_as("SELECT version, checksum, success FROM _sqlx_migrations")
+            .fetch_all(pool)
+            .await
+            .context("could not read the applied migrations")?
+    } else {
+        Vec::new()
+    };
+
+    let mut missing = Vec::new();
+    for expected in MIGRATOR.iter() {
+        let version = expected.version;
+        let description = &expected.description;
+        match applied.iter().find(|(v, _, _)| *v == version) {
+            // Applied but not finished. `sqlx migrate run` refuses to move past
+            // one of these, so pointing at it would send the operator round a
+            // loop that cannot end.
+            Some((_, _, false)) => anyhow::bail!(
+                "migration {version} ({description}) is recorded as failed — the database is \
+                 dirty and has to be repaired by hand before migrations can continue"
+            ),
+            Some((_, checksum, true)) if checksum[..] != expected.checksum[..] => {
+                anyhow::bail!(
+                    "migration {version} ({description}) does not match the one this database \
+                     ran — it was edited after being applied, so the schema and the file have \
+                     drifted and only one of them can be right"
+                )
+            }
+            Some(_) => {}
+            None => missing.push(format!("{version} ({description})")),
+        }
+    }
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the database is missing {} of {} migration(s) — {} — {MIGRATE_HINT}",
+        missing.len(),
+        MIGRATOR.iter().count(),
+        missing.join(", "),
+    );
+
+    Ok(())
 }

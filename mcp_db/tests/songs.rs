@@ -93,9 +93,9 @@ async fn the_schema_the_servers_require_is_present() {
         return;
     };
 
-    // `mcp_db::connect` refuses to hand back a pool unless both tables exist,
-    // so a migration that stopped creating one should fail here rather than at
-    // a server's startup.
+    // `mcp_db::connect` checks that every migration has *run*, not what it
+    // created, so a migration that stopped creating one of these should fail
+    // here rather than at the first query that needs it.
     for table in ["songs", "purchase_options"] {
         let exists: bool = query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(table)
