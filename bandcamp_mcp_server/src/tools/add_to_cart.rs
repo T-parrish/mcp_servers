@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::bandcamp::{
-    BandcampClient, CartError, DEFAULT_CART_ORIGIN, SessionStatus, bandcamp_origin,
+    BandcampClient, CartError, DEFAULT_CART_ORIGIN, Price, SessionStatus, bandcamp_origin,
 };
 use crate::server::BandcampServer;
 use crate::tools::json_result;
@@ -29,16 +29,19 @@ pub struct AddToCartParams {
     pub item_id: u64,
     /// Item type: "album", "track", or "package". Defaults to "album".
     pub item_type: Option<String>,
-    /// Price to pay, in the item's currency. Must meet the item's minimum price
-    /// (many Bandcamp items are "name your price").
-    pub unit_price: f64,
+    /// Price to pay, in the item's currency. Defaults to the item's minimum,
+    /// read from its page at `item_url`; a lower price is refused. Many
+    /// Bandcamp items are "name your price", so paying more is allowed.
+    pub unit_price: Option<f64>,
     /// Seller's band id (the `band_id` from a search result). Recommended: Bandcamp
     /// associates the cart line with the selling band.
     pub band_id: Option<u64>,
     /// Quantity to add. Defaults to 1.
     pub quantity: Option<u32>,
-    /// The item's Bandcamp URL (e.g. from a search result). Used to target the
-    /// correct site origin for the request; defaults to https://bandcamp.com.
+    /// The item's Bandcamp URL (e.g. from a search result). Its page is where
+    /// the minimum price is read, so it is required unless `unit_price` is
+    /// given. Also targets the correct site origin for the request; defaults
+    /// to https://bandcamp.com.
     pub item_url: Option<String>,
     /// Human-readable item name, used only in logs and the confirmation message.
     pub item_name: Option<String>,
@@ -98,7 +101,10 @@ impl BandcampServer {
         description = "Add a Bandcamp item to your cart by its item id. Requires a logged-in \
                           session via BANDCAMP_COOKIE. Dry-run by default: it only sends the real \
                           request when BANDCAMP_ALLOW_CART_WRITES=1, otherwise it returns the \
-                          request that would be sent. unit_price must meet the item's minimum."
+                          request that would be sent. Pass the item's `item_url`: the price is read \
+                          from its page, `unit_price` defaults to the item's minimum, and a \
+                          unit_price below the minimum is refused. The result shows the price and \
+                          its currency."
     )]
     #[tracing::instrument(
         name = "tools/call add_to_cart",
@@ -126,6 +132,70 @@ impl BandcampServer {
         let quantity = params.quantity.unwrap_or(1);
         let origin = origin_from_url(params.item_url.as_deref());
 
+        // The minimum is read from the item's page. When it cannot be (the `Err`
+        // says why), a caller-given price is sent unchecked with a warning; with
+        // no price either, there is nothing safe to send.
+        let minimum: Result<Price, String> = match params.item_url.as_deref() {
+            None => Err("no item_url was given, so the price was not checked".to_string()),
+            Some(url) => match self
+                .client()
+                .item_price(url, item_type, params.item_id)
+                .await
+            {
+                Ok(Some(price)) => Ok(price),
+                // The page was read and does not list this item: most often a
+                // track id sent with the default item_type "album", or an item
+                // only sold as part of a release. Neither should reach the cart.
+                Ok(None) => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "the page at {url} does not sell item {} as item_type {:?}. Check \
+                             that item_type matches item_id (search results are tracks), and \
+                             that the item is sold on its own.",
+                            params.item_id,
+                            params.item_type.as_deref().unwrap_or("album"),
+                        ),
+                        None,
+                    ));
+                }
+                Err(e) => Err(format!("the price could not be checked: {e:#}")),
+            },
+        };
+        let unit_price = match (params.unit_price, &minimum) {
+            (Some(price), Ok(min)) if price < min.amount => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unit_price {price} is below this item's minimum of {} {}",
+                        min.amount, min.currency
+                    ),
+                    None,
+                ));
+            }
+            (Some(price), _) => price,
+            (None, Ok(min)) => min.amount,
+            (None, Err(why)) => {
+                return Err(McpError::invalid_params(
+                    format!("no unit_price was given and {why}; pass unit_price"),
+                    None,
+                ));
+            }
+        };
+        // Shown in every result, so the price and currency are visible before
+        // (and after) anything is sent.
+        let price_view = match &minimum {
+            Ok(min) => json!({
+                "unit_price": unit_price,
+                "currency": min.currency,
+                "minimum": min.amount,
+            }),
+            Err(why) => json!({
+                "unit_price": unit_price,
+                "currency": null,
+                "minimum": null,
+                "warning": why,
+            }),
+        };
+
         // Fields for the /cart/cb "add" operation, per the reverse-engineered protocol.
         let mut form: Vec<(&str, String)> = vec![
             ("req", "add".to_string()),
@@ -134,7 +204,7 @@ impl BandcampServer {
             ("local_id", rand_id()),
             ("item_type", item_type.to_string()),
             ("item_id", params.item_id.to_string()),
-            ("unit_price", format!("{}", params.unit_price)),
+            ("unit_price", format!("{unit_price}")),
             ("quantity", quantity.to_string()),
         ];
         if let Some(band_id) = params.band_id {
@@ -161,6 +231,7 @@ impl BandcampServer {
                             actually add to the cart.",
                 "target_url": target_url,
                 "request": request_view,
+                "price": price_view,
                 "item_name": params.item_name,
             }));
         }
@@ -191,6 +262,7 @@ impl BandcampServer {
                     "mode": "sent",
                     "target_url": target_url,
                     "request": request_view,
+                    "price": price_view,
                     "cart_response": response,
                     "item_name": params.item_name,
                 }))

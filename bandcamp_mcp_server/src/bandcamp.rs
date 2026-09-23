@@ -442,6 +442,208 @@ impl BandcampClient {
         tracing::debug!(count = parsed.auto.results.len(), "autocomplete returned");
         Ok(parsed.auto.results)
     }
+
+    /// The price an item's page advertises for it, or `None` if the page does
+    /// not sell that item on its own (e.g. a track only sold with its album).
+    ///
+    /// `item_type` is Bandcamp's single-letter code (`"t"`, `"a"`, `"p"`).
+    pub(crate) async fn item_price(
+        &self,
+        item_url: &str,
+        item_type: &str,
+        item_id: u64,
+    ) -> anyhow::Result<Option<Price>> {
+        let ld = self.item_page(item_url).await?;
+        price_in(&ld, item_type, item_id)
+    }
+
+    /// What a track's page says about it: its price, and what identifies the
+    /// recording (to confirm it is the song searched for).
+    pub(crate) async fn track_page(
+        &self,
+        track_url: &str,
+        track_id: u64,
+    ) -> anyhow::Result<TrackPage> {
+        let ld = self.item_page(track_url).await?;
+        Ok(TrackPage {
+            price: price_in(&ld, "t", track_id)?,
+            recording: recording_in(&ld),
+        })
+    }
+
+    /// Fetch an item's page and return its schema.org JSON-LD.
+    ///
+    /// The page is fetched **without** the session cookie: `item_url` comes
+    /// from search results or the model, and nothing on the page needs a login.
+    #[tracing::instrument(
+        name = "GET",
+        skip(self),
+        fields(
+            otel.kind = "client",
+            otel.name = "GET",
+            http.request.method = "GET",
+            url.full = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+        ),
+        err,
+    )]
+    async fn item_page(&self, item_url: &str) -> anyhow::Result<serde_json::Value> {
+        let span = tracing::Span::current();
+        let origin = bandcamp_origin(item_url)
+            .with_context(|| format!("{item_url:?} is not a bandcamp URL"))?;
+        // Rebuilt from the validated origin, dropping any query or fragment.
+        let path = reqwest::Url::parse(item_url)?.path().to_string();
+        let url = format!("{origin}{path}");
+        let host = origin.trim_start_matches("https://").to_string();
+        span.record("url.full", &url);
+        span.record("server.address", &host);
+
+        let _permit = self.limiter.acquire().await;
+        let started = Instant::now();
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .inspect_err(|_| {
+                mcp_core::metrics::record_request("GET", &host, None, None, started.elapsed());
+            })
+            .context("fetching the item page failed")?;
+
+        let status = resp.status();
+        span.record("http.response.status_code", status.as_u16());
+        mcp_core::metrics::record_request(
+            "GET",
+            &host,
+            None,
+            Some(status.as_u16()),
+            started.elapsed(),
+        );
+        if !status.is_success() {
+            anyhow::bail!("item page returned HTTP {status}");
+        }
+        // A redirect off Bandcamp would mean the data came from someone else's page.
+        if bandcamp_origin(resp.url().as_str()).is_none() {
+            anyhow::bail!("item page redirected off bandcamp, to {}", resp.url());
+        }
+        let html = resp.text().await.context("reading the item page failed")?;
+        page_json_ld(&html)
+    }
+}
+
+/// An item's price as its page advertises it: the minimum for digital items
+/// ("name your price" ones included, where it may be 0), the fixed price for
+/// packages.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Price {
+    pub(crate) amount: f64,
+    /// ISO 4217 code; the artist's currency, not the buyer's.
+    pub(crate) currency: String,
+}
+
+/// What a track's page says about it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TrackPage {
+    /// `None` when the track is not sold on its own.
+    pub(crate) price: Option<Price>,
+    pub(crate) recording: Recording,
+}
+
+/// What identifies a recording, where the page states it. Labels often leave
+/// the ISRC out; the duration is nearly always there.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Recording {
+    pub(crate) isrc: Option<String>,
+    pub(crate) duration_secs: Option<u32>,
+}
+
+/// The schema.org JSON-LD block of an item page.
+fn page_json_ld(html: &str) -> anyhow::Result<serde_json::Value> {
+    const OPEN: &str = r#"<script type="application/ld+json">"#;
+    let start = html.find(OPEN).context("item page has no JSON-LD")? + OPEN.len();
+    let len = html[start..]
+        .find("</script>")
+        .context("item page's JSON-LD is unterminated")?;
+    serde_json::from_str(&html[start..start + len]).context("item page's JSON-LD is invalid")
+}
+
+/// Find the price of one item in an item page's JSON-LD.
+///
+/// Every buyable thing on the page is an `Offer` whose `url` ends in
+/// `#<type><id>-buy` — `#t…` the track, `#a…` the album, `#p…` a physical
+/// package, `#b…` a discography bundle — so the fragment picks out exactly the
+/// item asked for. `Ok(None)` means the page does not sell that item.
+fn price_in(
+    ld: &serde_json::Value,
+    item_type: &str,
+    item_id: u64,
+) -> anyhow::Result<Option<Price>> {
+    let suffix = format!("#{item_type}{item_id}-buy");
+    let Some(offer) = find_offer(ld, &suffix) else {
+        return Ok(None);
+    };
+    // Digital offers state their minimum as `minPrice`; packages have only a price.
+    let amount = offer
+        .pointer("/priceSpecification/minPrice")
+        .or_else(|| offer.get("price"))
+        .and_then(|v| v.as_f64())
+        .context("the item's offer has no price")?;
+    let currency = offer
+        .get("priceCurrency")
+        .and_then(|v| v.as_str())
+        .context("the item's offer has no currency")?
+        .to_string();
+    Ok(Some(Price { amount, currency }))
+}
+
+/// The recording a track page is about: its top-level `MusicRecording`.
+fn recording_in(ld: &serde_json::Value) -> Recording {
+    Recording {
+        isrc: ld
+            .get("isrcCode")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string()),
+        duration_secs: ld
+            .get("duration")
+            .and_then(|v| v.as_str())
+            .and_then(parse_duration),
+    }
+}
+
+/// Seconds in an ISO 8601 duration as Bandcamp writes it: `P00H03M10S`.
+fn parse_duration(iso: &str) -> Option<u32> {
+    let rest = iso.strip_prefix('P')?;
+    // Strict ISO puts a `T` before the time part; Bandcamp omits it.
+    let rest = rest.strip_prefix('T').unwrap_or(rest);
+    let (hours, rest) = rest.split_once('H')?;
+    let (minutes, rest) = rest.split_once('M')?;
+    let seconds = rest.strip_suffix('S')?;
+    Some(
+        hours.parse::<u32>().ok()? * 3600
+            + minutes.parse::<u32>().ok()? * 60
+            + seconds.parse::<u32>().ok()?,
+    )
+}
+
+/// Depth-first search for the `Offer` whose `url` ends with `suffix`.
+fn find_offer<'a>(value: &'a serde_json::Value, suffix: &str) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_match = map.get("@type").and_then(|t| t.as_str()) == Some("Offer")
+                && map
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .is_some_and(|u| u.ends_with(suffix));
+            if is_match {
+                return Some(value);
+            }
+            map.values().find_map(|v| find_offer(v, suffix))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|v| find_offer(v, suffix)),
+        _ => None,
+    }
 }
 
 impl Default for BandcampClient {
@@ -481,7 +683,13 @@ pub(crate) struct RawResult {
 
 #[cfg(test)]
 mod tests {
-    use super::bandcamp_origin;
+    use super::{
+        Price, Recording, bandcamp_origin, page_json_ld, parse_duration, price_in, recording_in,
+    };
+
+    fn parse_price(html: &str, item_type: &str, item_id: u64) -> anyhow::Result<Option<Price>> {
+        price_in(&page_json_ld(html)?, item_type, item_id)
+    }
 
     #[test]
     fn accepts_bandcamp_hosts() {
@@ -533,5 +741,106 @@ mod tests {
             bandcamp_origin("https://user:pass@bandcamp.com:8443/cart"),
             Some("https://bandcamp.com".to_string())
         );
+    }
+
+    /// A track page, trimmed to the shape Bandcamp serves: the track's own
+    /// offer sits beside the release's packages and a discography bundle, all
+    /// nested under `inAlbum`.
+    const TRACK_PAGE: &str = r##"<html><head>
+<script type="application/ld+json">
+{"@type":"MusicRecording","name":"Windowlicker","isrcCode":"GBBPW9900001","duration":"P00H06M07S","inAlbum":{"albumRelease":[
+  {"@type":"MusicRelease","offers":{"@type":"Offer",
+    "url":"https://aphextwin.bandcamp.com/track/windowlicker#t229736348-buy",
+    "priceCurrency":"GBP","price":0.99,"priceSpecification":{"minPrice":0.99}}},
+  {"@type":"MusicRelease","offers":{"@type":"Offer",
+    "url":"https://aphextwin.bandcamp.com/track/windowlicker#p2080462178-buy",
+    "priceCurrency":"GBP","price":12.99,"priceSpecification":{"price":12.99}}},
+  {"@type":"MusicRelease","offers":{"@type":"Offer",
+    "url":"https://aphextwin.bandcamp.com/track/windowlicker#b113942541-buy",
+    "priceCurrency":"GBP","price":51.43,"priceSpecification":{"minPrice":51.43}}}
+]}}
+</script>
+</head><body></body></html>"##;
+
+    #[test]
+    fn finds_the_requested_items_price() {
+        assert_eq!(
+            parse_price(TRACK_PAGE, "t", 229736348).unwrap(),
+            Some(Price {
+                amount: 0.99,
+                currency: "GBP".into()
+            })
+        );
+        // A package has a fixed price rather than a minimum.
+        assert_eq!(
+            parse_price(TRACK_PAGE, "p", 2080462178).unwrap(),
+            Some(Price {
+                amount: 12.99,
+                currency: "GBP".into()
+            })
+        );
+    }
+
+    #[test]
+    fn prefers_the_minimum_over_the_listed_price() {
+        let page = TRACK_PAGE.replace(
+            r#""price":0.99,"priceSpecification":{"minPrice":0.99}"#,
+            r#""price":1.5,"priceSpecification":{"minPrice":1.0}"#,
+        );
+        assert_eq!(
+            parse_price(&page, "t", 229736348).unwrap().unwrap().amount,
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_free_item_costs_zero_rather_than_nothing() {
+        let page = TRACK_PAGE.replace(
+            r#""price":0.99,"priceSpecification":{"minPrice":0.99}"#,
+            r#""price":0.0,"priceSpecification":{"minPrice":0.0}"#,
+        );
+        assert_eq!(
+            parse_price(&page, "t", 229736348).unwrap().unwrap().amount,
+            0.0
+        );
+    }
+
+    #[test]
+    fn an_item_the_page_does_not_sell_has_no_price() {
+        // Wrong type for the id: the fragment must match exactly, so a track id
+        // passed as an album is not mistaken for the track.
+        assert_eq!(parse_price(TRACK_PAGE, "a", 229736348).unwrap(), None);
+        // An id that is a prefix of a real one must not match it.
+        assert_eq!(parse_price(TRACK_PAGE, "t", 22973634).unwrap(), None);
+    }
+
+    #[test]
+    fn a_page_without_structured_data_is_an_error() {
+        assert!(parse_price("<html>login</html>", "t", 229736348).is_err());
+    }
+
+    #[test]
+    fn reads_the_recordings_isrc_and_duration() {
+        let ld = page_json_ld(TRACK_PAGE).unwrap();
+        assert_eq!(
+            recording_in(&ld),
+            Recording {
+                isrc: Some("GBBPW9900001".into()),
+                duration_secs: Some(367),
+            }
+        );
+    }
+
+    #[test]
+    fn a_page_without_them_identifies_nothing() {
+        let ld = serde_json::json!({"@type": "MusicRecording", "isrcCode": ""});
+        assert_eq!(recording_in(&ld), Recording::default());
+    }
+
+    #[test]
+    fn parses_bandcamps_durations() {
+        assert_eq!(parse_duration("P00H03M10S"), Some(190));
+        assert_eq!(parse_duration("P01H00M01S"), Some(3601));
+        assert_eq!(parse_duration("3:10"), None);
     }
 }

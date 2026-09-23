@@ -119,7 +119,7 @@ telemetry=0
 for arg in "$@"; do
   case "$arg" in
     -t | --telemetry) telemetry=1 ;;
-    spotify | bandcamp | both)
+    spotify | bandcamp | beatport | both)
       if [ -n "$server" ]; then
         echo "run.sh: target already set to '$server'" >&2
         exit 64
@@ -135,7 +135,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$server" ]; then
-  echo "usage: $(basename "$0") {spotify|bandcamp|both} [--telemetry]" >&2
+  echo "usage: $(basename "$0") {spotify|bandcamp|beatport|both} [--telemetry]" >&2
   exit 64 # EX_USAGE
 fi
 

@@ -7,6 +7,7 @@ A Cargo workspace of [MCP](https://modelcontextprotocol.io) servers written in R
 |-------|------------|
 | [`spotify_mcp_server`](spotify_mcp_server) | Log in via OAuth (PKCE), list your playlists, list a playlist's tracks, save its songs. Official Spotify Web API. |
 | [`bandcamp_mcp_server`](bandcamp_mcp_server) | Search artists and songs, record where a library song can be bought, add to cart. Bandcamp's undocumented internal API. |
+| [`beatport_mcp_server`](beatport_mcp_server) | Record where a library song can be bought on Beatport and for how much, matched by ISRC — optionally only for songs Bandcamp did not have. Beatport's v4 API, with a bearer token copied from a logged-in session. |
 | [`mcp_core`](mcp_core) | Library shared by both servers: telemetry setup, OpenTelemetry instruments, the outbound rate limiter, and tool-result helpers. |
 | [`mcp_db`](mcp_db) | Library shared by both servers: the Postgres pool, the schema, and the writes. |
 
@@ -134,8 +135,10 @@ Two tables:
   currency. Written by the Bandcamp server's `find_purchase_options`, which takes a song's artist
   and title, requires that song to already be in `songs`, and appends a row per Bandcamp hit — plus
   a row with a NULL `url` when a search finds nothing, so "looked and found nothing" is
-  distinguishable from "never looked". `price` and `currency` stay NULL for now: Bandcamp's search
-  endpoint does not report a price, and filling them would mean fetching each item's page.
+  distinguishable from "never looked". Bandcamp's search endpoint reports no price, so each hit's
+  page is fetched for it: `price` is the track's minimum in the artist's `currency` (a "name your
+  price" track records its minimum, often `0.00`). Both stay NULL when the track is not sold on its
+  own or its page could not be read — the row is still recorded.
 
 The current state of a song on each platform is the most recent row per platform:
 
@@ -171,6 +174,7 @@ mcp_servers/
   mcp_core/             shared library crate
   spotify_mcp_server/   binary crate
   bandcamp_mcp_server/  binary crate
+  beatport_mcp_server/  binary crate
   target/               shared build output
 ```
 

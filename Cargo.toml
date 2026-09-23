@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["mcp_core", "mcp_db", "mcp_db/sqlx_shim", "bandcamp_mcp_server", "spotify_mcp_server"]
+members = ["mcp_core", "mcp_db", "mcp_db/sqlx_shim", "bandcamp_mcp_server", "beatport_mcp_server", "spotify_mcp_server"]
 
 [workspace.package]
 version = "0.1.0"

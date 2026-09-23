@@ -8,7 +8,7 @@
 
 mod common;
 
-use mcp_db::{NewPurchaseOption, NewSong};
+use mcp_db::{NewPurchaseOption, NewSong, SongDetails};
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_postgres::PgPool;
 
@@ -81,11 +81,15 @@ async fn searches_accumulate_rather_than_replace() {
                 song_id: id,
                 platform: "bandcamp".into(),
                 url: Some("https://naibu.bandcamp.com/track/caught-me-falling".into()),
+                price: None,
+                currency: None,
             },
             NewPurchaseOption {
                 song_id: id,
                 platform: "bandcamp".into(),
                 url: Some("https://label.bandcamp.com/album/compilation".into()),
+                price: None,
+                currency: None,
             },
         ],
     )
@@ -100,6 +104,8 @@ async fn searches_accumulate_rather_than_replace() {
             song_id: id,
             platform: "bandcamp".into(),
             url: Some("https://naibu.bandcamp.com/track/caught-me-falling".into()),
+            price: None,
+            currency: None,
         }],
     )
     .await
@@ -133,6 +139,8 @@ async fn a_fruitless_search_is_still_recorded() {
             song_id: id,
             platform: "bandcamp".into(),
             url: None,
+            price: None,
+            currency: None,
         }],
     )
     .await
@@ -166,6 +174,8 @@ async fn an_option_cannot_dangle() {
             song_id: 999_999,
             platform: "bandcamp".into(),
             url: None,
+            price: None,
+            currency: None,
         }],
     )
     .await;
@@ -179,6 +189,8 @@ async fn an_option_cannot_dangle() {
             song_id: id,
             platform: "bandcamp".into(),
             url: Some("https://example.bandcamp.com/track/x".into()),
+            price: None,
+            currency: None,
         }],
     )
     .await
@@ -196,6 +208,132 @@ async fn an_option_cannot_dangle() {
         .await
         .unwrap();
     assert_eq!(left, 0, "ON DELETE CASCADE should remove the options too");
+
+    db.cleanup().await;
+}
+
+/// The price is stored exactly as the page gave it, with its currency, and a
+/// row without one stays NULL rather than becoming 0 — which would claim the
+/// song is free.
+#[tokio::test]
+async fn prices_are_recorded_with_their_currency() {
+    let Some(db) = common::TestDb::new().await else {
+        return;
+    };
+    let id = seed(&db.pool, "Aphex Twin", "Windowlicker").await;
+
+    mcp_db::insert_purchase_options(
+        &db.pool,
+        &[
+            NewPurchaseOption {
+                song_id: id,
+                platform: "bandcamp".into(),
+                url: Some("https://aphextwin.bandcamp.com/track/windowlicker".into()),
+                price: Some(0.99),
+                currency: Some("GBP".into()),
+            },
+            NewPurchaseOption {
+                song_id: id,
+                platform: "bandcamp".into(),
+                url: Some("https://label.bandcamp.com/track/windowlicker".into()),
+                price: None,
+                currency: None,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx_core::query_as::query_as(
+        "SELECT price::text, currency::text FROM purchase_options WHERE song_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some("0.99".to_string()), Some("GBP".to_string())),
+            (None, None),
+        ]
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_songs_details_can_be_looked_up() {
+    let Some(db) = common::TestDb::new().await else {
+        return;
+    };
+    let mut known = song("Trex", "Architect");
+    known.isrc = Some("GBQSE2600008".into());
+    known.duration_ms = Some(274_000);
+    mcp_db::insert_songs(&db.pool, &[known]).await.unwrap();
+    let id = mcp_db::find_song_id(&db.pool, "Trex", "Architect")
+        .await
+        .unwrap()
+        .unwrap();
+    let bare = seed(&db.pool, "Some Artist", "No Details").await;
+
+    assert_eq!(
+        mcp_db::song_details(&db.pool, id).await.unwrap(),
+        SongDetails {
+            isrc: Some("GBQSE2600008".into()),
+            duration_ms: Some(274_000),
+        }
+    );
+    assert_eq!(
+        mcp_db::song_details(&db.pool, bare).await.unwrap(),
+        SongDetails::default()
+    );
+
+    db.cleanup().await;
+}
+
+/// Only the most recent search on a platform decides whether a song was found
+/// there, and a search elsewhere does not count.
+#[tokio::test]
+async fn found_on_reflects_the_latest_search_on_that_platform() {
+    let Some(db) = common::TestDb::new().await else {
+        return;
+    };
+    let id = seed(&db.pool, "Naibu", "Caught Me Falling").await;
+    let search = |platform: &str, url: Option<&str>| NewPurchaseOption {
+        song_id: id,
+        platform: platform.into(),
+        url: url.map(Into::into),
+        price: None,
+        currency: None,
+    };
+
+    assert!(
+        !mcp_db::found_on(&db.pool, id, "bandcamp").await.unwrap(),
+        "never searched counts as not found"
+    );
+
+    mcp_db::insert_purchase_options(
+        &db.pool,
+        &[search(
+            "bandcamp",
+            Some("https://naibu.bandcamp.com/track/x"),
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(mcp_db::found_on(&db.pool, id, "bandcamp").await.unwrap());
+    assert!(
+        !mcp_db::found_on(&db.pool, id, "beatport").await.unwrap(),
+        "a find on one platform says nothing about another"
+    );
+
+    // A later search that found nothing supersedes the earlier find.
+    mcp_db::insert_purchase_options(&db.pool, &[search("bandcamp", None)])
+        .await
+        .unwrap();
+    assert!(!mcp_db::found_on(&db.pool, id, "bandcamp").await.unwrap());
 
     db.cleanup().await;
 }

@@ -15,7 +15,7 @@ items to a cart.
 |------|-----------|---------|
 | `search_artists` | `query` (string), `limit` (int, default 10) | Artists: `name`, `artist_id`, `location`, `url` |
 | `search_songs` | `artist` (string), `query` (string, optional), `limit` (int, default 10) | Songs: `title`, `artist`, `band_id`, `album`, `track_id`, `url` |
-| `add_to_cart` | `item_id` (int), `unit_price` (float), `item_type` (`"album"`/`"track"`/`"package"`, default `"album"`), `band_id` (int, optional), `quantity` (int, default 1), `item_url` (string, optional), `item_name` (string, optional) | The request that was (or would be) sent, plus Bandcamp's cart response, or an `auth_required` result |
+| `add_to_cart` | `item_id` (int), `unit_price` (float, optional: defaults to the item's minimum), `item_type` (`"album"`/`"track"`/`"package"`, default `"album"`), `band_id` (int, optional), `quantity` (int, default 1), `item_url` (string, optional), `item_name` (string, optional) | The request that was (or would be) sent, the price checked against the item's page, plus Bandcamp's cart response, or an `auth_required` result |
 | `authenticate` | `from_browser` (bool, optional), `cookie` (string, optional) | Auth status (`authenticated` / `invalid_cookie` / `unauthenticated`) and `fan_id`. Pass `from_browser:true` to pull the cookie from Chrome, or `cookie` to set it manually |
 
 `search_songs` searches tracks matching `artist` (optionally narrowed by `query`) and keeps only
@@ -62,7 +62,13 @@ returns an `auth_required` result prompting you to call `authenticate` again.
 - **Live:** with `BANDCAMP_ALLOW_CART_WRITES=1` and a valid session, it POSTs to the item's site
   (derived from `item_url`, else `bandcamp.com`) and returns Bandcamp's response.
 
-`unit_price` must meet the item's minimum (many Bandcamp items are "name your price").
+The price is read from the item's page at `item_url` (fetched without the session cookie).
+`unit_price` defaults to the item's minimum, and a lower one is refused before anything is sent;
+paying more is allowed, since many items are "name your price". Prices are in the artist's currency,
+which the result's `price` shows. If the page does not list `item_id` as `item_type` — most often a
+track id sent with the default `"album"` — the call is refused. Without `item_url`, or if the page
+cannot be read, a given `unit_price` is sent unchecked with a `warning`, and no `unit_price` is an
+error.
 
 > This adds to **your own** cart on **your own** account. Because it modifies real account state and
 > the endpoint is reverse-engineered, it is dry-run by default; verify the first live call yourself.

@@ -329,6 +329,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "beatport_mcp_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenv",
+ "mcp_core",
+ "mcp_db",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "binrw"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
