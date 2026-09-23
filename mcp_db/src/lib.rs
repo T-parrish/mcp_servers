@@ -24,7 +24,10 @@ use sqlx_core::query_as::query_as;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_postgres::PgPoolOptions;
 
-pub use purchase_options::{NewPurchaseOption, find_song_id, insert_purchase_options};
+pub use purchase_options::{
+    NewPurchaseOption, SongDetails, find_song_id, found_on, insert_purchase_options, song_details,
+    titles_match,
+};
 pub use songs::{NewSong, insert_songs};
 pub use sqlx_postgres::PgPool;
 
